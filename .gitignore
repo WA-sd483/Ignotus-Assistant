@@ -1,0 +1,51 @@
+# ===== 虚拟环境与缓存（861 MB / 11920 个文件，绝不能上传）=====
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+.vscode/
+
+# ===== ★★绝不可上传：里面是明文 API key =====
+# config.json   你的设置（API key / 权限白名单），程序运行时会在 exe 同级重新生成
+# stats.json    Token 用量统计
+# launch_task.log  启动日志
+config.json
+stats.json
+launch_task.log
+
+# ===== 大文件（GitHub 单文件硬上限 100 MB，50 MB 就警告）=====
+# models/   SenseVoice ASR 模型，229 MB
+# runtime/  下载流水线「装在项目内」的 GPT-SoVITS，GB 级
+models/
+runtime/
+
+# ===== 第三方素材：按拍板口径只走 Release 附件 =====
+# pet/      角色贴图帧
+# voices/   音效 + 参考样本（含第三方游戏音频）
+# refs/     角色参考音频（音色克隆必需）
+pet/
+voices/
+refs/
+# ★assets/avatar/ **故意不忽略** —— 2026-09-29 拍板：头像随仓库一起公开
+#   （assets/icon/ 是界面图标，程序要用，同样保留）。
+
+# ===== 暂不公开（2026-09-29 拍板）=====
+# docs/        需求 / 技术 / 设计文档（含界面截图）
+# devlog/      开发日志
+# design.md    顶层设计规范 —— ★它**不在** docs/ 里，差点漏掉（同属「不公开」口径）
+docs/
+devlog/
+design.md
+
+# ===== 成品与系统垃圾 =====
+*.zip
+*.exe
+Thumbs.db
+desktop.ini
+
+# ★★本文件**不能写行尾注释**（2026-09-29 实测踩过）：
+#   `config.json   # 说明` 会被 git 当成**整行一个模式**（含空格与中文）⇒ 永远匹配不上、
+#   而且**一声不吭**。注释只能**独占一行**。验法：`git check-ignore -v <文件>` 或
+#   `git add -A --dry-run` 看清单里还有没有它。

@@ -1,0 +1,8 @@
+# 运行依赖
+PySide6
+Pillow
+openai
+sherpa-onnx
+sounddevice
+numpy
+imageio-ffmpeg
