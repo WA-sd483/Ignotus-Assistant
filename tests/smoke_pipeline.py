@@ -25,6 +25,7 @@
 跑法（在项目根目录）：
     .venv\\Scripts\\python.exe tests\\smoke_pipeline.py
 """
+import ast
 import os
 import sys
 import tempfile
@@ -474,6 +475,58 @@ check("系统消息换行后高度按真实宽度算（文字不被纵向裁）"
 win.mark_quitting()
 win.deleteLater()
 qapp.processEvents()
+
+# ---- 探针替身的「公开名」必须与真实模块对齐（2026-09-30 新增）----
+# 4 个端到端探针（boot / danger / reply / sleep）用 `types.ModuleType` 造 `app.tts` / `app.asr` 替身，
+# 再真的跑一次 `app.main.main()`。
+# ★★**替身少一个名字 = `main.py` 的 worker 线程 `from .tts import X` 抛 ImportError** ⇒
+#   线程**静默死掉**（异常只打在 stderr）⇒ 现象是「AI 一直不回复」，用例**级联**失败。
+#   2026-09-30 实测踩过：新加的 `DEFAULT_TEXT_LANGUAGE` 没同步进替身，
+#   `smoke_permissions` / `smoke_sleep` / `reply_probe` **三套集体假红** —— 而报错长这样：
+#   `ImportError: cannot import name 'DEFAULT_TEXT_LANGUAGE' from 'app.tts' (unknown location)`
+#   （`unknown location` 就是"这是个内存里造的替身、没有 __file__"的指纹）。
+# 所以这里按 **AST** 把两边比一遍，让「加了新公开名、忘了同步替身」在**秒级**暴露，
+# 而不是等到跑完整套才看到一堆莫名其妙的失败。
+print()
+print("== 10. 探针替身 ⊆ 真实模块：公开名不许漏 ==")
+
+
+def _imported_names(modname: str) -> set:
+    """`app/*.py` 里所有 `from .<modname> import a, b` 的**被导入名**。"""
+    names = set()
+    for src in (Path(__file__).resolve().parent.parent / "app").glob("*.py"):
+        tree = ast.parse(src.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").lstrip(".") == modname:
+                names.update(a.name for a in node.names)
+    return names
+
+
+def _stubbed_names(path: Path, modname: str) -> set:
+    """探针里 `_stub("<modname>", **kwargs)` 提供的名字（只认**字面量**第一个参数）。"""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_stub" and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == modname):
+            found.update(kw.arg for kw in node.keywords if kw.arg)
+    return found
+
+
+_TESTS = Path(__file__).resolve().parent
+for _probe in sorted(_TESTS.glob("*_probe.py")):
+    for _mod in ("tts", "asr"):
+        _want = _imported_names(_mod)
+        if not _want:
+            continue
+        _have = _stubbed_names(_probe, f"app.{_mod}")
+        if not _have:
+            continue          # 这个探针没替身该模块（比如 danger_probe 不替 asr 的某几个名）
+        _miss = sorted(_want - _have)
+        check(f"{_probe.name} 的 app.{_mod} 替身覆盖了 app 代码导入的全部名字",
+              not _miss, f"缺 {_miss}")
 
 print()
 print(f"共 {total[0]} 项断言，失败 {len(fails)} 项")

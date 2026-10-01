@@ -23,6 +23,13 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# ★★单跑也默认走「无声后端」（开关在 `app/patpat.py` 顶部）：本机 QtMultimedia 的 FFmpeg
+#   后端在「**刚 play 就 stop**」时会**偶发挂死** —— 本套实测卡在 `_patpat_stop()`（源码 3052 行），
+#   卡点之后约 2200 行**永远跑不到**，整套只能靠 300s 硬超时强杀。
+#   ★关掉它**不改被测行为**：`play()` 在 `_ensure()` **之前**就写了 `self._last`
+#     ⇒ `last_played` 系断言照旧全绿（实测）。细则见 TECH-GOTCHAS「六」。
+#   ★要验真后端：`IGNOTUS_NO_AUDIO=0 .venv/Scripts/python.exe tests/smoke_pet.py`。
+os.environ.setdefault("IGNOTUS_NO_AUDIO", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 try:  # 控制台重定向时保证中文输出可读
     sys.stdout.reconfigure(encoding="utf-8")

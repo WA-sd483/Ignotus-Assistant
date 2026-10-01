@@ -161,8 +161,8 @@ def settle(ms=500):
 
 nav_texts = [b.text() for b in (win._nav_chat_btn, win._nav_manage_btn, win._nav_settings_btn)]
 check("顶部导航为 聊天/管理/设置", nav_texts == ["聊天", "管理", "设置"], str(nav_texts))
-check("右栏页面数 = 3 主页面 + 设置项数",
-      win._right_stack.count() == 3 + len(win.SETTINGS_ITEMS), str(win._right_stack.count()))
+check("右栏页面数 = 4 主页面 + 设置项数",
+      win._right_stack.count() == 4 + len(win.SETTINGS_ITEMS), str(win._right_stack.count()))
 check("通用设置页索引 = SETTINGS_BASE", win._settings_index["general"] == win.SETTINGS_BASE,
       str(win._settings_index))
 check("权限管理页紧随其后", win._settings_index["permissions"] == win.SETTINGS_BASE + 1, str(win._settings_index))
@@ -204,16 +204,18 @@ check("进管理：左栏切到管理导航",
       and win._left_mode == win.LEFT_MODE_MANAGE and not win._settings_mode)
 check("进管理：底色也是浅蓝 #C7E1FB",
       win._left_panel.bg_rgb() == (199, 225, 251), str(win._left_panel.bg_rgb()))
-check("管理导航项数 = 2", len(win._manage_nav_btns) == 2, str(len(win._manage_nav_btns)))
-check("管理导航文案 = 管理 API / 管理唤醒词",
-      [b.text() for _i, b in win._manage_nav_btns] == ["管理 API", "管理唤醒词"],
+check("管理导航项数 = 3（API / 唤醒词 / 设定卡）", len(win._manage_nav_btns) == 3,
+      str(len(win._manage_nav_btns)))
+check("管理导航文案 = 管理 API / 管理唤醒词 / 设定卡（设定卡排最后）",
+      [b.text() for _i, b in win._manage_nav_btns] == ["管理 API", "管理唤醒词", "设定卡"],
       str([b.text() for _i, b in win._manage_nav_btns]))
-check("管理导航项索引 = PAGE_API / PAGE_WAKE",
-      [i for i, _b in win._manage_nav_btns] == [win.PAGE_API, win.PAGE_WAKE],
+check("管理导航项索引 = PAGE_API / PAGE_WAKE / PAGE_PRESET",
+      [i for i, _b in win._manage_nav_btns] == [win.PAGE_API, win.PAGE_WAKE, win.PAGE_PRESET],
       str([i for i, _b in win._manage_nav_btns]))
-check("管理导航项指向真实面板（ApiPanel / WakeWordPanel）",
+check("管理导航项指向真实面板（ApiPanel / WakeWordPanel / PresetPanel）",
       isinstance(win._right_stack.widget(win.PAGE_API), gui.ApiPanel)
-      and isinstance(win._right_stack.widget(win.PAGE_WAKE), gui.WakeWordPanel))
+      and isinstance(win._right_stack.widget(win.PAGE_WAKE), gui.WakeWordPanel)
+      and isinstance(win._right_stack.widget(win.PAGE_PRESET), gui.PresetPanel))
 check("管理项样式与设置项逐字一致（同一份皮肤）",
       win._manage_nav_btns[0][1].styleSheet() == _set_nav_style,
       repr(win._manage_nav_btns[0][1].styleSheet()))
@@ -226,7 +228,544 @@ check("角色头像 / 编辑 / 切换角色都在被隐去的角色页里（管�
       and win._left_role_page.isAncestorOf(win._pencil_btn)
       and win._left_role_page.isAncestorOf(win._switch_btn))
 
+# ---- 设定卡（管理区第 3 页，2026-09-30）----
+# 用户口径：左栏「管理」新增「设定卡」（**排最后**）；页面只有「预设」一个区块；
+# 卡片 = 实心圆单选 + 预设命名 + 蓝底白字「查看」；预设**只可查看**（不可编辑 / 删除）；
+# 「查看」弹窗 **540×460**（2026-09-30 二次改版：高度 −20）、五项各用一个文本框框住、可下拉、
+# 下侧留位放「关闭」按钮；**唯一的关法 = 点底部那颗「关闭」**
+# （同日晚些时候做过的「点弹窗外关闭」已按用户要求**整块删除**，为什么它不好使见 docs/02 §25.6）；
+# **跟随当前角色**；「回复语言」当前只读、固定日语。
+from PySide6.QtCore import QEvent as _QEvent, QPointF as _QPointF  # noqa: E402
+from PySide6.QtGui import QMouseEvent as _QMouseEvent  # noqa: E402
+
+check("PAGE_PRESET == 3 且仍在管理区（在设置区之前）",
+      win.PAGE_PRESET == 3 and win.PAGE_PRESET < win.SETTINGS_BASE,
+      f"{win.PAGE_PRESET}/{win.SETTINGS_BASE}")
+check("SETTINGS_BASE 已随管理页增加挪到 4（设置页索引没被压坏）", win.SETTINGS_BASE == 4,
+      str(win.SETTINGS_BASE))
+check("设定卡页归属「管理」（左栏=管理导航、顶栏=管理）",
+      win._left_mode_for(win.PAGE_PRESET) == win.LEFT_MODE_MANAGE
+      and win._is_manage_page(win.PAGE_PRESET))
+
+win._show_preset_panel()
+check("可切到「设定卡」页", win._right_stack.currentIndex() == win.PAGE_PRESET)
+check("顶栏点亮「管理」而不是「设置」",
+      win._nav_manage_btn.isChecked() and not win._nav_settings_btn.isChecked())
+check("左栏进入管理导航", win._left_mode == win.LEFT_MODE_MANAGE)
+check("左栏「设定卡」那颗按钮为选中",
+      dict(win._manage_nav_btns)[win.PAGE_PRESET].isChecked())
+
+_pres = win._preset_panel
+check("面板类型为 PresetPanel", isinstance(_pres, gui.PresetPanel))
+check("面板实现了 _msg（管理 / 设置面板的硬约定，缺了会在写回后静默报错）",
+      callable(getattr(_pres, "_msg", None)))
+_pres_txts = [w.text() for w in _pres.findChildren(QLabel) if w.text()]
+check("页面标题与左栏导航项同名（「设定卡」）", "设定卡" in _pres_txts, str(_pres_txts))
+check("页面只有「预设」一个区块（「自定义」区块还没做）",
+      "预设" in _pres_txts and "自定义" not in _pres_txts, str(_pres_txts))
+
+_cards = _pres.findChildren(gui._PresetCard)
+check("预设卡有 2 张（2026-09-30 第二批：wiki 版 + 局内聊天记录统计版）",
+      len(_cards) == 2, str(len(_cards)))
+_card = _cards[0]
+check("★跟随当前角色：第一张卡片名 = 天童爱丽丝（wiki）",
+      _card._name_text == "天童爱丽丝（wiki）", _card._name_text)
+check("★卡片顺序 = 配置里的顺序（内置在前、新增在后）",
+      [c._name_text for c in _cards]
+      == ["天童爱丽丝（wiki）", "天童爱丽丝（局内聊天记录统计）"],
+      str([c._name_text for c in _cards]))
+check("★第一张（= 角色 persona 指向的那份）选中", _card._dot.isChecked())
+check("★★第二张**未**选中（页面如实反映：当前实际用的仍是 wiki 版）",
+      not _cards[1]._dot.isChecked())
+check("★长预设名没被截断、右边那颗「查看」也没被挤掉",
+      _cards[1]._name.text() == "天童爱丽丝（局内聊天记录统计）",
+      repr(_cards[1]._name.text()))
+check("current_name() 与卡片名一致（选中判据 = 角色的 persona 字段）",
+      _pres.current_name() == "天童爱丽丝（wiki）", _pres.current_name())
+check("卡片高 58px、单选 18px（与设置页行同一规格）",
+      _card.height() == 58 and _card._dot.width() == 18,
+      f"{_card.height()}/{_card._dot.width()}")
+check("卡片上只有一个按钮且是「查看」",
+      [b.text() for b in _card.findChildren(gui.QPushButton)] == ["查看"],
+      str([b.text() for b in _card.findChildren(gui.QPushButton)]))
+check("★「查看」不进键盘焦点链（NoFocus）", _card._view_btn.focusPolicy() == Qt.NoFocus)
+# ★★2026-09-30 晚：整卡**点得动 = 切到这张预设**（用户口径「点整张卡或圆点都可以切换，
+#   但点击右侧的按钮不会切换」）⇒ 早先那条「整卡点不动」的口径已反转。
+#   ★切换只落在 `mouseReleaseEvent`（不是 press）：按下去又拖到卡外松手**不算**点击。
+check("★整卡可点：`_PresetCard` 接管**松开**事件、且没有另写一份按下逻辑",
+      "mouseReleaseEvent" in gui._PresetCard.__dict__
+      and "mousePressEvent" not in gui._PresetCard.__dict__,
+      str(sorted(k for k in gui._PresetCard.__dict__ if "Mouse" in k)))
+check("★可点得有可点的样子：整卡是手型光标（「查看」按钮自带同一个）",
+      _card.cursor().shape() == Qt.PointingHandCursor,
+      str(_card.cursor().shape()))
+check("★单选是**实心圆**那款（`_PresetDot`）",
+      isinstance(_card._dot, gui._PresetDot)
+      and (gui._PresetDot.DOT, gui._PresetDot.BORDER) == (18, 1),
+      f"{gui._PresetDot.DOT}/{gui._PresetDot.BORDER}")
+check("★实心圆直径 < 外圈直径（内部真的画了实心圆）",
+      0 < gui._PresetDot.SOLID < gui._PresetDot.DOT,
+      f"{gui._PresetDot.SOLID}/{gui._PresetDot.DOT}")
+check("★圆点仍**不吃**鼠标事件 ⇒ 点击穿透到卡片，点圆点与点卡片走同一条切换路径"
+      "（不必在圆点里再写一份）",
+      _card._dot.testAttribute(Qt.WA_TransparentForMouseEvents))
+check("★全项目只剩这一款单选钮：`_RadioDot` 已整块删除（2026-10-01 用户口径："
+      "「关闭行为」改成和设定卡一样）⇒ 别再从别处溜回来",
+      not hasattr(gui, "_RadioDot"))
+
+# ★★2026-09-30 晚（第五批）：预设卡 hover = **与「管理 API」/「管理唤醒词」的卡片同一条**
+#   用户口径：「鼠标悬停时卡片的变化效果参照管理 api 和管理唤醒词里的卡片效果」。
+#   ⇒ 底色 200ms 白 → 淡蓝渐变、**描边保持 #CBD5E1**（hover 不染蓝），
+#     复用 `_HoverRow` 混入类（`_ApiRow` / `_WakeRow` / `_PermRow` 同一个）。
+check("★预设卡复用 `_HoverRow`（与 API / 唤醒词 / 权限行同一个 hover 混入类）",
+      issubclass(gui._PresetCard, gui._HoverRow),
+      str([b.__name__ for b in gui._PresetCard.__mro__[:4]]))
+check("★预设卡 hover 动画 = 200ms（与 API / 唤醒词行同一条节奏）",
+      _card._hover_anim.duration() == 200, str(_card._hover_anim.duration()))
+check("★hover 走 `_HoverRow` 那对事件（enter / leave 都在混入类里，卡片自己不重写）",
+      "enterEvent" not in gui._PresetCard.__dict__
+      and "leaveEvent" not in gui._PresetCard.__dict__
+      and callable(getattr(gui, "_HoverRow", None).enterEvent),
+      str(sorted(k for k in gui._PresetCard.__dict__ if "Event" in k)))
+_card._apply_bg(0.0)
+check("未 hover：预设卡底色为白 rgb(255,255,255)",
+      "rgb(255,255,255)" in _card.styleSheet(), _card.styleSheet()[:80])
+_card._apply_bg(1.0)
+check("★hover：预设卡底色淡蓝 rgb(230,241,255)（与 API / 唤醒词行同一插值）",
+      "rgb(230,241,255)" in _card.styleSheet(), _card.styleSheet()[:80])
+check("★hover 只动底色、描边**保持** #CBD5E1（不染蓝 —— 与 API / 唤醒词行一致）",
+      "border:1px solid #CBD5E1" in _card.styleSheet()
+      and "border-color" not in _card.styleSheet(), _card.styleSheet()[:80])
+check("★卡片底色插值不影响「查看」按钮（仍是蓝底白字主按钮）",
+      "QPushButton#presetViewBtn{background:#378ADD; color:#FFFFFF" in _card.styleSheet(),
+      _card.styleSheet()[-90:])
+_card._apply_bg(0.0)          # 还原成白，别把 hover 态留给后面的用例
+check("★hover 后能还原成白（enter / leave 是对称的，不会卡在淡蓝）",
+      "rgb(255,255,255)" in _card.styleSheet(), _card.styleSheet()[:80])
+
+# 数据源：config.roles[*].presets；「当前预设」由 persona 字段推出，**不设第二份状态**
+check("配置里有 presets：爱丽丝 2 张、艾莲 1 张",
+      len(win.cfg["roles"]["alice"]["presets"]) == 2
+      and len(win.cfg["roles"]["ellen"]["presets"]) == 1,
+      str({k: v.get("presets") for k, v in win.cfg["roles"].items()}))
+check("★没有引入 `current_preset` 之类的第二份状态（否则两边会静默各说各话）",
+      all("current_preset" not in r for r in win.cfg["roles"].values()))
+
+# ★★内置预设必须"并回来"（2026-09-30 第二批踩到；细则见 `config._merge_presets` 的 docstring）：
+#   `_deep_merge` 对**列表是整段替换**，而 `save_config` 会把 `roles` 整段写进 `config.json`
+#   ⇒ 配置文件里那份「上次保存时的预设快照」会把默认配置**新加的内置预设盖掉**，而且**不报错**
+#   ⇒ 现象是「代码里明明加了张卡，页面上就是不出现」。
+#   ★本机真实的 `config.json` 就是这种状态（只有 1 张的旧快照），所以这里**必须**端到端演一遍：
+#     单跑一份「只存了第一张」的配置 ⇒ `load_config()` 仍要给出两张，且顺序不变。
+_old_cfg_path = cfgmod.CONFIG_PATH
+_snap_dir = Path(tempfile.mkdtemp(prefix="ignotus_presets_"))
+_snap_path = _snap_dir / "config.json"
+_snap_path.write_text(json.dumps(
+    {"roles": {"alice": {"persona": "persona/alice.md",
+                         "presets": [{"name": "天童爱丽丝（wiki）",
+                                      "persona": "persona/alice.md"}]}}},
+    ensure_ascii=False), encoding="utf-8")
+cfgmod.CONFIG_PATH = _snap_path
+try:
+    _re = cfgmod.load_config()["roles"]["alice"]["presets"]
+finally:
+    cfgmod.CONFIG_PATH = _old_cfg_path
+check("★★端到端：配置文件里的旧快照**盖不住**新加的内置预设（且顺序不变）",
+      [i["name"] for i in _re]
+      == ["天童爱丽丝（wiki）", "天童爱丽丝（局内聊天记录统计）"],
+      str([i["name"] for i in _re]))
+check("★正对照：那份快照里本来**只有 1 张**（否则上面那条是空转）",
+      len(json.loads(_snap_path.read_text(encoding="utf-8"))
+          ["roles"]["alice"]["presets"]) == 1)
+# ★★「并回来的那张卡」的内容也必须是**逐字原文**（2026-09-30 晚真踩到：`_merge_presets`
+#   里对值随手 `.strip()`，把内置卡人设**末尾那个换行**吃掉 ⇒ 它比 `roles[*].persona`
+#   少一个字符 ⇒ 卡片显示成"未选中"，点它还会被判成"换了张卡"白写一次盘）。
+#   ★只核「并回来的是哪几张卡（名字）」抓不住这个 —— 名字一样、内容差一个字符。
+check("★★并回来的那张内置卡，人设是**逐字原文**（末尾换行没被吃掉）",
+      _re[1]["persona"] == (Path(__file__).resolve().parent.parent / "persona"
+                            / "alice_chatlog.md").read_text("utf-8"),
+      repr(_re[1]["persona"][-14:]))
+
+_builtin = [{"name": "甲", "persona": "p/a.md"}, {"name": "乙", "persona": "p/b.md"}]
+check("★旧快照（只存了「甲」）⇒ 内置的「乙」并回来，顺序 = 默认顺序",
+      cfgmod._merge_presets(_builtin, [{"name": "甲", "persona": "p/a.md"}])
+      == [{"name": "甲", "persona": "p/a.md"}, {"name": "乙", "persona": "p/b.md"}],
+      str(cfgmod._merge_presets(_builtin, [{"name": "甲", "persona": "p/a.md"}])))
+check("★配置文件里有、默认里没有的项（将来的用户自定义）保留并**追加在后面**",
+      [i["name"] for i in cfgmod._merge_presets(
+          _builtin, [{"name": "丙", "persona": "p/c.md"}])] == ["甲", "乙", "丙"],
+      str([i["name"] for i in cfgmod._merge_presets(
+          _builtin, [{"name": "丙", "persona": "p/c.md"}])]))
+check("★同名项以**配置文件里那份**为准（尊重用户改动过的人设内容）",
+      cfgmod._merge_presets(_builtin, [{"name": "甲", "persona": "p/改过.md"}])[0]
+      == {"name": "甲", "persona": "p/改过.md"})
+check("默认里没有这个角色 ⇒ 原样返回（不吃掉用户自己加的角色）",
+      cfgmod._merge_presets(None, [{"name": "丁", "persona": "p/d.md"}])
+      == [{"name": "丁", "persona": "p/d.md"}])
+
+# ★★「人设值不许 strip」的回归（2026-09-30 晚**真踩到**）：值现在是**人设全文**，
+#   而人设文件末尾那个换行是它的一部分 —— `_merge_presets` 里随手 `.strip()` 一下，
+#   内置卡的文本就比 `roles[*].persona` **少一个字符** ⇒ `presets[*].persona == persona`
+#   不再成立 ⇒ 那张卡在页面上**显示成"未选中"**（不报错），点它还会被判成"换了张卡"白写一次盘。
+_TXT_NL = "# 标题\n\n## 设定\n- 一行。\n"
+check("★★`_merge_presets` 原样搬运人设值（末尾换行没被 strip 掉）",
+      cfgmod._merge_presets([{"name": "甲", "persona": _TXT_NL}],
+                            [{"name": "乙", "persona": "x"}])[0]["persona"] == _TXT_NL,
+      repr(cfgmod._merge_presets([{"name": "甲", "persona": _TXT_NL}],
+                                 [{"name": "乙", "persona": "x"}])[0]["persona"]))
+
+# ★★人设载体迁移：`persona` 从「素材路径」解析成「人设全文」（2026-09-30 晚）。
+#   入口唯一 = `config.resolve_persona_text`；运行时与「查看」弹窗都走它。
+_ALICE_MD = Path(__file__).resolve().parent.parent / "persona" / "alice.md"
+_ALICE_TXT = _ALICE_MD.read_text("utf-8")
+check("resolve_persona_text：路径 ⇒ 文件原文（逐字相等）",
+      cfgmod.resolve_persona_text("persona/alice.md") == _ALICE_TXT)
+check("resolve_persona_text：已是全文 ⇒ 原样返回（一个字符都不动）",
+      cfgmod.resolve_persona_text(_TXT_NL) == _TXT_NL)
+check("resolve_persona_text：像路径但读不到 ⇒ 空串"
+      "（宁可不带设定，也不把 `persona/xx.md` 这个路径串当人设喂给模型）",
+      cfgmod.resolve_persona_text("persona/这个文件不存在.md") == "")
+check("resolve_persona_text：单行自定义文本 ⇒ 原样返回（不被误判成路径）",
+      cfgmod.resolve_persona_text("你是爱丽丝。") == "你是爱丽丝。")
+
+_mig_dir = Path(tempfile.mkdtemp(prefix="ignotus_persona_"))
+_mig_path = _mig_dir / "config.json"
+_mig_path.write_text(json.dumps(
+    {"roles": {"alice": {"persona": "persona/alice.md",
+                         "presets": [{"name": "天童爱丽丝（wiki）",
+                                      "persona": "persona/alice.md"},
+                                     {"name": "天童爱丽丝（局内聊天记录统计）",
+                                      "persona": "persona/alice_chatlog.md"}]}}},
+    ensure_ascii=False), encoding="utf-8")
+_old_cfg2 = cfgmod.CONFIG_PATH
+cfgmod.CONFIG_PATH = _mig_path
+try:
+    _mig = cfgmod.load_config()["roles"]["alice"]
+finally:
+    cfgmod.CONFIG_PATH = _old_cfg2
+check("★★老配置（存的是**路径**）⇒ 加载时解析成**全文**",
+      _mig["persona"] == _ALICE_TXT
+      and [p["persona"] for p in _mig["presets"]][0] == _ALICE_TXT,
+      repr(_mig["persona"][:20]))
+check("★★当前人设与第一张卡**逐字相等**（含 `# 标题` 与末尾换行）"
+      "—— 这是「哪张预设选中」的**唯一判据**",
+      _mig["persona"] == _mig["presets"][0]["persona"])
+check("★与 md 原文逐字相等 ⇒ 喂给模型的 system prompt **零变化**（时长 / 回复内容不变）",
+      _mig["persona"] == _ALICE_TXT and _mig["persona"].endswith("\n"))
+
+# ★★`load_config` **不许就地改写 `DEFAULT_CONFIG`**：它是**浅拷贝**（`out = dict(base)`，
+#   遇到 list 直接沿用同一个对象），而角色段归一化会**就地写** `persona` / `presets`
+#   ⇒ 以前那几行恰好幂等所以没暴出来，现在"路径 ⇒ 全文"不幂等了：默认配置会被第一次
+#   `load_config()` 灌满人设全文，之后所有拿默认配置当基准的断言都在跟一份被污染的数据比。
+check("★★跑过 `load_config` 之后，默认配置里的 persona 仍是**素材路径**（没被灌成全文）",
+      cfgmod.DEFAULT_CONFIG["roles"]["alice"]["persona"] == "persona/alice.md",
+      repr(cfgmod.DEFAULT_CONFIG["roles"]["alice"]["persona"])[:28])
+check("★默认配置里的 presets 也仍是路径（两个都要核，否则只防住一半）",
+      [p["persona"] for p in cfgmod.DEFAULT_CONFIG["roles"]["alice"]["presets"]]
+      == ["persona/alice.md", "persona/alice_chatlog.md"],
+      str([p["persona"] for p in cfgmod.DEFAULT_CONFIG["roles"]["alice"]["presets"]]))
+
+# 「查看」→ 五个展示项（把真弹窗拦掉，只看它拿到什么）
+_keep_role = win._current_role_key
+
+
+def _capture_view():
+    seen = {}
+    real = gui.PresetViewDialog.view
+    gui.PresetViewDialog.view = staticmethod(
+        lambda parent, name, rows: seen.update(name=name, rows=rows))
+    return seen, real
+
+
+_seen, _real_view = _capture_view()
+try:
+    _pres._on_view("天童爱丽丝（wiki）", _pres._presets()[0])
+finally:
+    gui.PresetViewDialog.view = _real_view
+check("查看：五项且顺序 = 角色背景设定 / 说话风格 / 口癖 / 称呼 / 回复语言",
+      [t for t, _v in _seen.get("rows", [])] == ["角色背景设定", "说话风格", "口癖", "称呼", "回复语言"],
+      str([t for t, _v in _seen.get("rows", [])]))
+check("查看：回复语言 = 日语（取自 tts.DEFAULT_TEXT_LANGUAGE，页面上只读）",
+      dict(_seen.get("rows", [])).get("回复语言") == "日语",
+      str(dict(_seen.get("rows", [])).get("回复语言")))
+check("查看：内容确实取到了（背景里含「机器人」）—— 2026-09-30 晚起取自**卡片自带的人设全文**",
+      "机器人" in dict(_seen.get("rows", [])).get("角色背景设定", ""))
+_alice_rows = list(_seen.get("rows", []))
+
+# ---- 第二张预设（局内聊天记录统计版，2026-09-30 第二批）：内容必须真的从 alice_chatlog.md 读出来 ----
+# ★它和 wiki 版是**两份人设文件**，所以「两张卡都拿得到内容、且内容不同」也要钉住 ——
+#   只核「卡片有 2 张」是表象：两张指向同一个文件照样能过。
+_seen2, _real_view2 = _capture_view()
+try:
+    _pres._on_view("天童爱丽丝（局内聊天记录统计）", _pres._presets()[1])
+finally:
+    gui.PresetViewDialog.view = _real_view2
+_c2 = dict(_seen2.get("rows", []))
+check("★第二张预设的五项都取到了（没有落到占位）",
+      [t for t, _v in _seen2.get("rows", [])]
+      == ["角色背景设定", "说话风格", "口癖", "称呼", "回复语言"]
+      and all(v and v != gui.PRESET_EMPTY for _t, v in _seen2.get("rows", [])),
+      str([(t, (v or "")[:10]) for t, v in _seen2.get("rows", [])]))
+check("★第二张的内容是「局内聊天记录」那一套（记录里出现过的原话）",
+      "哼哼哼" in _c2.get("口癖", "") and "宝箱里的道具是谁放进去的" in _c2.get("角色背景设定", ""),
+      (_c2.get("口癖", "")[:24], _c2.get("角色背景设定", "")[:24]))
+check("★口癖统一为「邦邦卡邦」+ 设定段已删「花丸贴纸」"
+      "（2026-09-30 用户口径：繁中/简中翻译差别，统一为邦邦卡邦）",
+      "邦邦卡邦" in _c2.get("口癖", "") and "兵啪喀兵" not in _c2.get("口癖", "")
+      and "花丸贴纸" not in _c2.get("角色背景设定", ""),
+      (_c2.get("口癖", "")[:24], _c2.get("角色背景设定", "")[:24]))
+check("★★两张预设的内容**确实不同**（不是同一份文件被挂了两遍）",
+      _c2.get("说话风格") != dict(_alice_rows).get("说话风格")
+      and _c2.get("角色背景设定") != dict(_alice_rows).get("角色背景设定"))
+check("★第二张也带「回复语言 = 日语」（只读项，取值入口仍只有 tts.DEFAULT_TEXT_LANGUAGE）",
+      _c2.get("回复语言") == "日语", repr(_c2.get("回复语言")))
+check("★第二张的人设文件里**也写明了双语输出契约**（`|||` 与日语在前，缺了管线会解析不了）",
+      "|||" in (Path(__file__).resolve().parent.parent / "persona"
+                / "alice_chatlog.md").read_text(encoding="utf-8"))
+
+# ★口癖里的 `•` 必须**一律顶格对齐**（2026-09-30 二次改版，用户口径「有几条的 · 和其他没对齐」）：
+#   人设文件用 `  - ` 表示子项，但正文用**比例字体** ⇒ 两个半角空格既不像"缩进"也不像"顶格"，
+#   看起来就是几个 `•` 没对齐。显示层一律拍平；层级信息由人设的措辞承担（不改写任何字句）。
+check("★`_clean_preset_text` 拍平子级缩进（条目一律顶格）",
+      gui._clean_preset_text([" - 甲", "  - 乙", "\t- 丙", "- 丁"]) == "• 甲\n• 乙\n• 丙\n• 丁",
+      repr(gui._clean_preset_text([" - 甲", "  - 乙", "\t- 丙", "- 丁"])))
+_tics_src = (Path(__file__).resolve().parent.parent / "persona" / "alice.md").read_text(
+    encoding="utf-8")
+check("★正对照：人设文件里**确实有**子级缩进（否则下面那条断言是空转）",
+      any(ln.startswith("  - ") for ln in _tics_src.splitlines()), "人设文件里没有子级缩进")
+_tics_lines = [ln for ln in dict(_seen.get("rows", [])).get("口癖", "").splitlines() if "•" in ln]
+check("★口癖里的 `•` **一律顶格**（没有带前缀空格的条目 ⇒ 竖着看是一条线）",
+      bool(_tics_lines) and all(ln.startswith("• ") for ln in _tics_lines),
+      str([ln[:12] for ln in _tics_lines]))
+check("正对照：拍平**没吃掉**条目（5 条都还在，只是顶格了）",
+      len(_tics_lines) == 5, str(len(_tics_lines)))
+
+# 跟随角色：切到艾莲 ⇒ 卡片名与内容一起换；缺的小节照实留空、**不替她编内容**
+win._preset_panel.set_role("ellen")
+check("切到艾莲 ⇒ 卡片换成「艾莲（wiki）」",
+      [c._name_text for c in win._preset_panel.findChildren(gui._PresetCard)] == ["艾莲（wiki）"],
+      str([c._name_text for c in win._preset_panel.findChildren(gui._PresetCard)]))
+check("切到艾莲后依然选中", win._preset_panel.findChildren(gui._PresetCard)[0]._dot.isChecked())
+check("current_name() 跟着变", win._preset_panel.current_name() == "艾莲（wiki）",
+      win._preset_panel.current_name())
+_seen, _real_view = _capture_view()
+try:
+    win._preset_panel._on_view("艾莲（wiki）", win._preset_panel._presets()[0])
+finally:
+    gui.PresetViewDialog.view = _real_view
+_e = dict(_seen.get("rows", []))
+check("★艾莲缺「口癖 / 称呼」⇒ 显示占位，**不替她编内容**",
+      _e.get("口癖") == gui.PRESET_EMPTY and _e.get("称呼") == gui.PRESET_EMPTY,
+      f"{_e.get('口癖')}/{_e.get('称呼')}")
+check("艾莲有的小节照常取到（背景含「鲨鱼女仆」）", "鲨鱼女仆" in _e.get("角色背景设定", ""))
+win._preset_panel.set_role(_keep_role)
+
+# ---- 「查看」弹窗：尺寸 / 排版 / **唯一的关法 = 底部那颗「关闭」** ----
+_dv = gui.PresetViewDialog(win, "天童爱丽丝（wiki）", _alice_rows)
+check("卡片 540×460（用户口径；2026-09-30 二次改版高度 −20）",
+      (_dv._card.width(), _dv._card.height()) == (540, 460),
+      f"{_dv._card.width()}×{_dv._card.height()}")
+check("★窗口与卡片**同尺寸**（那圈透明边随「点弹窗外」一起删了 ⇒ 窗口里没有「外面」可点）",
+      (_dv.width(), _dv.height()) == (540, 460), f"{_dv.width()}×{_dv.height()}")
+_dv_boxes = _dv.findChildren(gui.QFrame, "presetFieldBox")
+check("五项 ⇒ 五个文本框", len(_dv_boxes) == 5, str(len(_dv_boxes)))
+check("底部有且只有一颗「关闭」按钮",
+      [b.text() for b in _dv.findChildren(gui.QPushButton)] == ["关闭"],
+      str([b.text() for b in _dv.findChildren(gui.QPushButton)]))
+check("与另外四款弹窗共用同一张卡片皮肤", gui._CARD_FRAME_QSS in _dv.styleSheet())
+_dv_scroll = _dv.findChild(gui.QScrollArea)
+check("弹窗可下拉：有滚动区且滚动条**常驻位**（与面板同一条）",
+      isinstance(_dv_scroll, gui.QScrollArea)
+      and _dv_scroll.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOn)
+check("水平不滚（长文本靠换行，不许横向滚）",
+      _dv_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff)
+check("滚动区右内边距 8px（给下拉条留的呼吸位）",
+      _dv_scroll.widget().layout().contentsMargins().right() == 8,
+      str(_dv_scroll.widget().layout().contentsMargins()))
+_dv.show()
+settle(60)
+_vp_w = _dv_scroll.viewport().width()
+check("文本框宽度跟着视口走（没被裁到视口之外）",
+      all(_vp_w - 24 <= b.width() <= _vp_w for b in _dv_boxes),
+      f"vp={_vp_w} boxes={[b.width() for b in _dv_boxes]}")
+_dv_bodies = [b.findChildren(QLabel)[0] for b in _dv_boxes]
+check("★每个文本框都拿到 heightForWidth 的高度（没被压成一行）",
+      all(abs(b.height() - b.heightForWidth(b.width())) <= 1 for b in _dv_bodies),
+      str([(b.height(), b.heightForWidth(b.width())) for b in _dv_bodies]))
+check("长内容确实换行成多行（背景那框 > 100px）", _dv_bodies[0].height() > 100,
+      str(_dv_bodies[0].height()))
+check("短内容不会被撑高（「回复语言」那框只有一行）", _dv_bodies[4].height() <= 20,
+      str(_dv_bodies[4].height()))
+
+# ★「点弹窗外关闭」那三层机制必须**已经删干净**（2026-09-30 用户拍板：仅靠按钮关闭）。
+#   只核「窗口里没有外面」还不够 —— 得钉住**那几处实现真的不在了**，否则有人照着旧文档
+#   把 `eventFilter` 加回来就又能「点外面」关（而用户要的是**只能**点按钮）。
+_DEAD_MECH = ("eventFilter", "paintEvent", "mousePressEvent", "showEvent", "hideEvent",
+              "card_rect_global")
+check("★三层关法（应用级过滤器 / 给那圈边描色 / 几何兜底）都**不在** `PresetViewDialog` 上",
+      all(n not in gui.PresetViewDialog.__dict__ for n in _DEAD_MECH),
+      str([n for n in _DEAD_MECH if n in gui.PresetViewDialog.__dict__]))
+check("★`OUTER` 常量也删了（它唯一的用途就是那圈透明边）",
+      not hasattr(gui.PresetViewDialog, "OUTER"))
+check("★正对照：基类 `_CardDialog.showEvent`（自下而上淡入）**还在** —— 删的是那三层，不是动画",
+      "showEvent" in gui._CardDialog.__dict__
+      and gui.PresetViewDialog.mro()[1] is gui._CardDialog,
+      str(gui.PresetViewDialog.__mro__[:3]))
+
+_dv.findChildren(gui.QPushButton)[0].click()          # 真点一下「关闭」
+settle(60)
+check("点「关闭」⇒ 弹窗关掉（这是唯一的关法）", not _dv.isVisible())
+
+
+# ★行为层再钉一次「点**外面** ⇒ 不关」—— 只查类字典是"表象"（代码不在 ≠ 行为对），
+#   得真喂一次落在主界面上的点击，看弹窗到底关不关。
+class _ClickCounter(QWidget):
+    """数自己被喂了几次按下 —— 用来证明弹窗**不再**理睬落在别处的点击。"""
+
+    def __init__(self):
+        super().__init__()
+        self.presses = 0
+
+    def mousePressEvent(self, e):  # noqa: N802 (Qt 命名)
+        self.presses += 1
+        super().mousePressEvent(e)
+
+
+def _press_at(widget, point):
+    """把一次**鼠标按下**喂给指定控件（全局坐标 = 给的 point）。"""
+    QApplication.sendEvent(widget, _QMouseEvent(
+        _QEvent.MouseButtonPress, _QPointF(point), _QPointF(point),
+        Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+
+
+_click_host = _ClickCounter()
+_click_host.resize(820, 540)
+_click_host.show()
+settle(30)
+
+_dv2 = gui.PresetViewDialog(_click_host, "天童爱丽丝（wiki）", _alice_rows)
+_dv2.show()
+settle(60)
+_press_at(_click_host, _QPointF(20, 20))              # 点主界面上（弹窗没盖住的地方）
+settle(60)
+check("★点**主界面上**（弹窗外）⇒ 弹窗**不关**（这条交互已按用户要求移除）", _dv2.isVisible())
+check("★而且这次按下**照常落到主界面**（没有谁在偷偷吞它）",
+      _click_host.presses == 1, str(_click_host.presses))
+_dv2.close()
+_click_host.close()
+
+
+# ================= ★★整卡可点 = 切换（2026-09-30 晚，用户口径） =================
+# 用户原话：「点整张卡或圆点都可以切换，**但点击右侧的按钮不会切换**」。
+# ★三条都**真喂事件、真看写盘**：只核"类里有 `mouseReleaseEvent`"是**表象**
+#   （有函数 ≠ 点得动 ≠ 点得对），而"有没有调 `save_config`"也不能只看名字
+#   —— 这里把 `gui.save_config` 换成记账替身，**顺便保证绝不写真 config.json**。
+def _release_at(widget, x, y):
+    """把一次**鼠标松开**喂给指定控件（局部坐标 = (x, y)）—— 与 `_press_at` 配成一对。"""
+    p = _QPointF(x, y)
+    QApplication.sendEvent(widget, _QMouseEvent(
+        _QEvent.MouseButtonRelease, p, p, Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+
+
+_sw_panel = win._preset_panel
+_sw_panel.set_role("alice")
+settle(30)
+_sw_cards = _sw_panel.findChildren(gui._PresetCard)
+_WIKI_NAME = "天童爱丽丝（wiki）"
+_LOG_NAME = "天童爱丽丝（局内聊天记录统计）"
+check("正对照：起点在爱丽丝页、两张卡、wiki 版选中",
+      len(_sw_cards) == 2 and _sw_panel.current_name() == _WIKI_NAME,
+      f"{len(_sw_cards)}/{_sw_panel.current_name()}")
+_alice_role = win.cfg["roles"]["alice"]
+_WIKI_TEXT = str(_alice_role["persona"])
+_LOG_TEXT = str(_sw_panel._presets()[1]["persona"])
+check("正对照：第二张的文本与第一张**逐字不同**（否则下面的「切换」是空转）",
+      _LOG_TEXT != _WIKI_TEXT and "哼哼哼" in _LOG_TEXT)
+check("正对照：切换前后的人设都是**多行全文**（载体已经是文本、不是路径）",
+      "\n" in _WIKI_TEXT and "\n" in _LOG_TEXT)
+
+_saves = []
+_real_save = gui.save_config
+gui.save_config = lambda cfg: _saves.append(cfg)
+try:
+    # ① 点**已选中**那张 ⇒ 什么都不做（否则"点一下当前那张"也会白写一次盘 + 白弹回执）
+    _release_at(_sw_cards[0], 30, 30)
+    check("★点已选中的那张 ⇒ 不写盘、人设不变",
+          _saves == [] and str(_alice_role["persona"]) == _WIKI_TEXT,
+          f"saves={len(_saves)}")
+
+    # ② 点**第二张卡** ⇒ 切过去
+    _release_at(_sw_cards[1], 30, 30)
+    check("★★点整张卡 ⇒ 切到第二张（cfg 里的当前人设 = 第二张的全文）",
+          str(_alice_role["persona"]) == _LOG_TEXT,
+          str(_alice_role["persona"])[:24])
+    check("★切换**落盘**了（save_config 恰好被调一次）", len(_saves) == 1, str(len(_saves)))
+    check("★★落盘那份里存的是**人设全文**（不是路径）"
+          "—— 这一步就是「此后运行不再读 persona/*.md」的实现点",
+          # ★`bool(_saves) and …` 的短路是必须的：上面的变异一旦让"切换"没发生，
+          #   `_saves` 就是空的 ⇒ 裸取 `_saves[-1]` 会抛 IndexError，**整套提前崩掉**、
+          #   后面几条断言根本没机会报红（反向验证时会被误读成"只红 2 条"）。
+          bool(_saves) and _saves[-1]["roles"]["alice"]["persona"] == _LOG_TEXT
+          and "\n" in _saves[-1]["roles"]["alice"]["persona"])
+    check("current_name() 跟着变（判据仍是「两份文本逐字相等」，没加第二份状态）",
+          _sw_panel.current_name() == _LOG_NAME, _sw_panel.current_name())
+    _after = _sw_panel.findChildren(gui._PresetCard)
+    check("★圆点拨过去了：第一张灭、第二张亮",
+          (not _after[0]._dot.isChecked()) and _after[1]._dot.isChecked())
+    check("★卡片对象**还是原来那两个**（只拨圆点、不重建 ⇒ 顺序与滚动位置不动，"
+          "且保住那颗圆点 500ms 的变色动画）",
+          _after[0] is _sw_cards[0] and _after[1] is _sw_cards[1])
+    check("★面板底部有回执（绿色消息行）", "已切换到" in _sw_panel._msg_label.text(),
+          _sw_panel._msg_label.text())
+
+    # ③ 再点第一张 ⇒ 切回去
+    _release_at(_sw_cards[0], 30, 30)
+    check("★再点第一张 ⇒ 切回 wiki 版，且又落了一次盘",
+          _sw_panel.current_name() == _WIKI_NAME and len(_saves) == 2,
+          f"{_sw_panel.current_name()} saves={len(_saves)}")
+
+    # ④ 按在卡里、拖到卡外才松手 ⇒ **不算点击**（判据 = 松开时指针还在卡里）
+    _release_at(_sw_cards[1], -5, -5)
+    check("★拖到卡外松手 ⇒ 不切换（不是「手一抖就把设定换了」）",
+          _sw_panel.current_name() == _WIKI_NAME and len(_saves) == 2,
+          f"{_sw_panel.current_name()} saves={len(_saves)}")
+
+    # ⑤ ★核心：点右侧「查看」⇒ **只弹窗、不切换**（事件被那颗按钮自己吃掉，卡片收不到）
+    _seen_sw, _real_sw = _capture_view()
+    try:
+        _press_at(_sw_cards[1]._view_btn, _QPointF(6, 6))
+        _release_at(_sw_cards[1]._view_btn, 6, 6)
+        settle(30)
+    finally:
+        gui.PresetViewDialog.view = _real_sw
+    check("★点「查看」⇒ 弹窗真的开了（证明这一下确实点到了那颗按钮）",
+          _seen_sw.get("name") == _LOG_NAME, str(_seen_sw.get("name")))
+    check("★★点「查看」⇒ **不切换**（人设仍是 wiki 版、没有多写一次盘）",
+          _sw_panel.current_name() == _WIKI_NAME and len(_saves) == 2,
+          f"{_sw_panel.current_name()} saves={len(_saves)}")
+
+    # ⑥ 空内容的卡不能切（切过去 = system prompt 变空 = 模型丢掉全部人设）
+    _release_at(_sw_cards[0], 30, 30)      # 先站回 wiki
+    _n_before = len(_saves)
+    _sw_panel._on_switch({"name": "空卡", "persona": ""})
+    check("★点一张**没有内容**的卡 ⇒ 不切换、只报错（不把 system prompt 变空）",
+          _sw_panel.current_name() == _WIKI_NAME and len(_saves) == _n_before
+          and "不能切换" in _sw_panel._msg_label.text(),
+          _sw_panel._msg_label.text())
+finally:
+    # ★只还原替身，**什么都不再做** —— 在 finally 里再调一次切换会走回真 `save_config`，
+    #   那会写到**真的 config.json**（本项目测试的硬要求是「绝不写真 config」）。
+    gui.save_config = _real_save
+
+# 结构断言：预设内容必须从 `config.roles[*].presets` 读，不许在 gui 里另写一张名单
+_pres_src = (Path(__file__).resolve().parent.parent / "app" / "gui.py").read_text(encoding="utf-8")
+check("★gui 里没有把预设名写死（唯一真值在 config）",
+      all(n not in _pres_src for n in
+          ("天童爱丽丝（wiki）", "艾莲（wiki）", "天童爱丽丝（局内聊天记录统计）")),
+      "gui.py 里出现了写死的预设名")
+
 # ---- ★★角色可切换性（2026-09-28 用户拍板；docs/02 §24）：艾莲暂不可切换 ----
+
 # 用户口径：「**主界面左侧头像下的切换**」里的艾莲要成**不可点击**的状态，暂时**仅可使用爱丽丝**。
 # ★艾莲**仍在列表里**（不删不藏），只是**灰显 + 选不中**（QComboBox 的标准做法：关 model item 的 enabled）。
 check("★★真值：`config.SWITCHABLE_ROLES == ('alice',)` —— ★钉**绝对值**"
@@ -1824,21 +2363,26 @@ for i in range(gen._body_lay.count()):
 check("含「开机自启」开关行", "_SettingToggleRow" in kinds, str(kinds))
 check("含「关闭行为」选项行", "_SettingChoiceRow" in kinds, str(kinds))
 
-# ---- 关闭行为：胶囊按钮 → 圆环型单选（2026-09-18 用户口径）----
+# ---- 关闭行为：胶囊按钮 → 圆型单选（2026-09-18 用户口径）→ ★实心圆（2026-10-01 用户口径）----
 _row_choice = next(w for w in gen.findChildren(gui._SettingChoiceRow))
 check("右侧是两个 _RadioItem，值仍是 tray / quit，且不再有胶囊按钮",
       list(_row_choice._items) == ["tray", "quit"]
       and _row_choice.findChildren(QPushButton) == [],
       str(list(_row_choice._items)))
-check("圆环尺寸 18×18，外层控件不吃鼠标事件（点击由整块接管）",
-      all(it._dot.width() == it._dot.height() == gui._RadioDot.DOT == 18
+check("★「关闭行为」的圆点 = 设定卡那款 `_PresetDot`（**同一个类**，不是长得像）",
+      all(isinstance(it._dot, gui._PresetDot) for it in _row_choice._items.values()),
+      str([type(it._dot).__name__ for it in _row_choice._items.values()]))
+check("圆点尺寸 18×18，圆点不吃鼠标事件（点击由整块接管）",
+      all(it._dot.width() == it._dot.height() == gui._PresetDot.DOT == 18
           and it._dot.testAttribute(Qt.WA_TransparentForMouseEvents)
           for it in _row_choice._items.values()),
       str([it._dot.size().toTuple() for it in _row_choice._items.values()]))
-check("圆环规格（2026-09-18）：边框粗细 1px、内圈外径 7px（内圈半径 3.5px）",
-      gui._RadioDot.BORDER == 1 and gui._RadioDot.INNER == 7,
-      f"border={gui._RadioDot.BORDER} inner={gui._RadioDot.INNER}")
-check("文字也不吃鼠标事件（点文字等同点圆环）",
+check("实心圆规格：边框 1px、实心圆直径 12px（< 外径 18 ⇒ 内部真的画了实心圆）",
+      gui._PresetDot.BORDER == 1 and 0 < gui._PresetDot.SOLID < gui._PresetDot.DOT,
+      f"border={gui._PresetDot.BORDER} solid={gui._PresetDot.SOLID}")
+check("★旧款 `_RadioDot`（圆心留白）已整块删除 —— 别再从别处溜回来",
+      not hasattr(gui, "_RadioDot"))
+check("文字也不吃鼠标事件（点文字等同点圆点）",
       all(it._lbl.testAttribute(Qt.WA_TransparentForMouseEvents)
           for it in _row_choice._items.values()))
 
@@ -1849,17 +2393,16 @@ def _dot_colors(dot):
             for x in range(img.width()) for y in range(img.height())}, img
 
 
-def _ink_radii(img):
-    """与 `#0C447C` 足够接近的像素到圆心的距离（用来验「有两层深蓝描边」）。
+def _on_radii(img):
+    """与主蓝 `#378ADD` 足够接近的像素到圆心的距离（内部实心圆 + 外圈都算进来）。
 
-    1px 边框 + 抗锯齿之后，dpr=1 的画布上**找不到一个纯度 100% 的 #0C447C 像素**
-    （实测最接近的是色距 2.45 的 #0D427B —— 1.5px 时代恰好有一个被完全覆盖的像素，
-    所以老断言能用等值），所以深蓝一律按"足够接近"判定；填充的蓝环不受影响，仍是精确的 #378ADD。
+    1px 圆环 + 抗锯齿之后，dpr=1 的画布上**未必有一个纯度 100% 的 #378ADD 像素**，
+    所以按"足够接近"判定（填充的实心圆那片不受影响，仍是精确值）。
     """
     def _dist(name):
         a = [int(name[1:3], 16), int(name[3:5], 16), int(name[5:7], 16)]
-        z = [int(gui._RadioDot.INK[1:3], 16), int(gui._RadioDot.INK[3:5], 16),
-             int(gui._RadioDot.INK[5:7], 16)]
+        z = [int(gui._PresetDot.ON[1:3], 16), int(gui._PresetDot.ON[3:5], 16),
+             int(gui._PresetDot.ON[5:7], 16)]
         return sum((p - q) ** 2 for p, q in zip(a, z)) ** 0.5
 
     cx, cy = img.width() / 2, img.height() / 2
@@ -1870,32 +2413,30 @@ def _ink_radii(img):
 
 _on_cols, _on_img = _dot_colors(_row_choice._items["tray"]._dot)
 _off_cols, _off_img = _dot_colors(_row_choice._items["quit"]._dot)
-_on_radii = _ink_radii(_on_img)
-_on_inner = [r for r in _on_radii if r < 5.0]      # 内圈：外径 7px ⇒ 描边中心半径 ≈3.5px
-_on_outer = [r for r in _on_radii if r > 7.5]      # 外圈：外径 18px ⇒ 描边中心半径 ≈9px
-check("选中态（tray）：外圈 / 内圈**两层**深蓝描边都在（内层 ≈3.5px、外层 ≈9px）",
-      len(_on_radii) >= 20 and len(_on_inner) >= 6 and len(_on_outer) >= 20
-      and 2.5 <= min(_on_inner) < 5.0 and max(_on_outer) > 8.0,
-      f"n={len(_on_radii)} inner={len(_on_inner)} outer={len(_on_outer)} "
-      f"min_inner={min(_on_inner) if _on_inner else None} "
-      f"max_outer={max(_on_outer) if _on_outer else None}")
-check("选中态：两条边框之间是蓝色圆环 #378ADD（整片填充，仍是精确值）",
-      gui._RadioDot.RING.lower() in _on_cols, sorted(_on_cols)[:6])
-check("选中态：圆心留白（白色）",
-      _on_img.pixelColor(_on_img.width() // 2, _on_img.height() // 2).name().lower() == "#ffffff",
+_on_radii = _on_radii(_on_img)
+_on_solid = [r for r in _on_radii if r < 5.0]      # 实心圆：直径 12px ⇒ 半径 ≈6px
+_on_ring = [r for r in _on_radii if r > 7.5]       # 外圈：外径 18px ⇒ 描边中心半径 ≈9px
+check("选中态（tray）：**内部实心圆**（半径 ≈6px）+ **外圈**（≈9px）都在",
+      len(_on_radii) >= 40 and len(_on_solid) >= 6 and len(_on_ring) >= 20
+      and max(_on_solid) > 3.0 and max(_on_ring) > 8.0,
+      f"n={len(_on_radii)} solid={len(_on_solid)} ring={len(_on_ring)} "
+      f"max_solid={max(_on_solid) if _on_solid else None} "
+      f"max_ring={max(_on_ring) if _on_ring else None}")
+check("★★选中态：**圆心是主蓝 #378ADD**（不是留白）—— 这正是与旧 `_RadioDot` 的唯一区别",
+      _on_img.pixelColor(_on_img.width() // 2, _on_img.height() // 2).name().lower()
+      == gui._PresetDot.ON.lower(),
       _on_img.pixelColor(_on_img.width() // 2, _on_img.height() // 2).name())
-check("未选中态（quit）：**只画最外层边框** —— 既没有蓝环、也没有内圈深蓝",
-      gui._RadioDot.RING.lower() not in _off_cols
-      and gui._RadioDot.INK.lower() not in _off_cols, sorted(_off_cols)[:6])
+check("未选中态（quit）：**只画灰外圈** —— 一个主蓝像素都没有",
+      gui._PresetDot.ON.lower() not in _off_cols, sorted(_off_cols)[:6])
 
 # 变色必须是**淡入淡出**（2026-09-18 用户口径），不是瞬间跳变
 check("变色动画规格：500ms / OutCubic",
-      gui._RadioDot.FADE_MS == 500
+      gui._PresetDot.FADE_MS == 500
       and _row_choice._items["tray"]._dot._anim.duration() == 500
       and _row_choice._items["tray"]._dot._anim.easingCurve().type() == gui.QEasingCurve.OutCubic,
-      f"{gui._RadioDot.FADE_MS}/{_row_choice._items['tray']._dot._anim.duration()}")
-_dot_a = gui._RadioDot(True)
-_dot_b = gui._RadioDot(False)
+      f"{gui._PresetDot.FADE_MS}/{_row_choice._items['tray']._dot._anim.duration()}")
+_dot_a = gui._PresetDot(True)
+_dot_b = gui._PresetDot(False)
 check("点火后进度从终态出发（选中 1.0 / 未选中 0.0）",
       _dot_a._t == 1.0 and _dot_b._t == 0.0, f"{_dot_a._t}/{_dot_b._t}")
 _dot_a.setChecked(False)
@@ -1909,7 +2450,7 @@ check("中段：两个圆环的着色进度都在 0~1 之间（确实是逐帧�
 QTest.qWait(700)                      # 补足 500ms，让动画落终态
 check("动画结束：进度精确落到 0 / 1",
       _dot_a._t == 0.0 and _dot_b._t == 1.0, f"{_dot_a._t}/{_dot_b._t}")
-_dot_c = gui._RadioDot(False)
+_dot_c = gui._PresetDot(False)
 _dot_c.setChecked(True, animate=False)
 check("animate=False 直接落终态（构建期用，省一次无谓动画）",
       _dot_c._t == 1.0 and _dot_c.isChecked(), str(_dot_c._t))
@@ -3200,6 +3741,22 @@ check("★★_uninstall_model 走 ChoiceDialog.choose（**三选一**），不�
       str(sorted(_um_calls)))
 check("★弹窗文案来自 voice_model.uninstall_message(cfg)（纯函数；不在 gui 里拼字符串）",
       ("voice_model", "uninstall_message") in _um_calls, str(sorted(_um_calls)))
+# ★★2026-10-01 二次（用户口径还是「弹窗里字太多」）：正文再压一行 ⇒ 定型 **6 行**。
+#   这一组断言钉的是**正文内容本身**（纯函数，离线可断言），不是"有没有调它"。
+_um_text = _vm.uninstall_message(cfg)
+_um_lines = _um_text.split("\n")
+check("★★卸载正文定型 6 行（标题 / 空行 / 一档一行 / 空行 / 收尾），两档各占一行、不折行",
+      len(_um_lines) == 6 and _um_lines[1] == "" and _um_lines[4] == ""
+      and _um_lines[0] == "确定要卸载音色克隆模型吗？",
+      "%d 行: %s" % (len(_um_lines), _um_lines))
+check("★★正文里**不再**出现「保留 refs…送进回收站、可还原」那一行"
+      "（2026-10-01 二次口径；行为没变，见 docs/02 §22.4 —— 删的只是文案）",
+      "回收站" not in _um_text and "保留 refs" not in _um_text, _um_text)
+check("★正文里也没有「安装位置：<长路径>」与「重装只需重下…」（这两句更早一轮删掉的）",
+      "安装位置" not in _um_text and "重装只需" not in _um_text, _um_text)
+check("★两档的体积数字**取自常量**（不是写死的 1.1 / 3.6）",
+      ("%.1f GB" % (_vm.MODEL_TOTAL_BYTES / 1024 ** 3)) in _um_text
+      and ("%.1f GB" % _vm.FULL_INSTALL_GB) in _um_text, _um_text)
 check("★卸载后真的调 _apply_model_state()（否则行上还写着「已下载」）",
       ("self", "_apply_model_state") in _um_calls, str(sorted(_um_calls)))
 _um_ln2 = {}
@@ -3243,6 +3800,87 @@ _choice_src = _src_gui_vol[_src_gui_vol.index("class ChoiceDialog"):
 check("★ChoiceDialog 的按钮 key 用默认参数钉住（`lambda _=False, k=key: ...`）"
       "—— 闭包直接捕获 `key` 会让三颗按钮全指向最后一个",
       "k=key" in _choice_src, str("k=key" in _choice_src))
+
+# ========== 5f. 弹窗的窗口模态 = WindowModal（2026-10-01：用户报「主界面一弹窗，桌宠点不动」）==
+#   根因：`setModal(True)` == `Qt.ApplicationModal` ⇒ **整个应用的所有顶层窗**一起被拦。
+#         桌宠窗虽然跟弹窗**没有**父子关系，也被 `EnableWindow(hwnd, FALSE)` ——
+#         真机量到的印记：`ApplicationModal` 下 main / pet 的 `IsWindowEnabled` **双双 False**。
+#   改法：`Qt.WindowModal`。Qt 判据（`QGuiApplicationPrivate::isWindowBlocked`，源码）=
+#         「从**被查询窗**沿 transient 父链上溯，看链上有没有窗是**模态窗的祖先**」⇒
+#           主窗 = 弹窗的 transient 父窗 ⇒ 被拦；桌宠窗 `transientParent() is None` ⇒ 不拦。
+#   ★★**QTest 的合成点击绕不过模态**（offscreen 与真 windows 两个平台都量过：连
+#     ApplicationModal 都没拦住 main）⇒ 这里**写不出**「点一下看有没有反应」的行为断言。
+#     能核的是「形状」——模态值 + transient 父链；而这两样正是上面那条判据的**全部输入**
+#     （真平台上的端到端证据见 `tests/probe_modal_pet_input.py`，它要弹真窗口，故不进 run_all）。
+#   ★★断言**全部走 AST**、不拿字符串找：`gui.py` 的注释里就原样写着 `setModal(True)` 这个写法
+#     （用来解释为什么不能用它）⇒ 字符串断言会被自己的注释骗红（本轮实测踩过）。
+_tree_gui_modal = ast.parse(_src_gui_vol)
+_card_cls = next(c for c in ast.walk(_tree_gui_modal)
+                 if isinstance(c, ast.ClassDef) and c.name == "_CardDialog")
+_card_init = next(n for n in _card_cls.body
+                  if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+_mod_calls = [n for n in ast.walk(_tree_gui_modal)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and n.func.attr in ("setModal", "setWindowModality")
+              and isinstance(n.func.value, ast.Name) and n.func.value.id == "self"]
+check("★★卡片弹窗基类 `_CardDialog` 的模态 = `Qt.WindowModal`（只锁父窗，桌宠仍可交互）",
+      gui._CardDialog.MODALITY == gui.Qt.WindowModal, str(gui._CardDialog.MODALITY))
+check("★★gui.py 里**一次都没有真的调** `setModal(True)`（= ApplicationModal，"
+      "会把桌宠窗一起拦掉；注释里写着这几个字**不算**）",
+      [n.lineno for n in _mod_calls
+       if n.func.attr == "setModal"
+       and any(isinstance(a, ast.Constant) and a.value is True for a in n.args)] == [],
+      str([(n.func.attr, n.lineno) for n in _mod_calls]))
+check("★模态**只有两处**调用：基类 `setWindowModality` + 倒计时弹窗 `setModal(False)`"
+      "（后者本来就不拦桌宠）—— 多出第三处必是有人把某个弹窗设回了 ApplicationModal",
+      sorted(n.func.attr for n in _mod_calls) == ["setModal", "setWindowModality"],
+      str(sorted((n.func.attr, n.lineno) for n in _mod_calls)))
+_winmod = [n for n in _mod_calls if n.func.attr == "setWindowModality"]
+_card_self_attrs = {n.attr for n in ast.walk(_card_init)
+                    if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                    and n.value.id == "self"}
+_card_qt_attrs = {n.attr for n in ast.walk(_card_init)
+                  if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                  and n.value.id == "Qt"}
+check("★★基类那句取的是常量 `self.MODALITY`（不写死字面量），"
+      "且 **parent 为 None 时兜底回 `Qt.ApplicationModal`**"
+      "（WindowModal 没有父窗可挂 ⇒ 谁也拦不住，比 ApplicationModal 还松）",
+      len(_winmod) == 1 and "MODALITY" in _card_self_attrs
+      and "ApplicationModal" in _card_qt_attrs,
+      "%d 处 / self.%s / Qt.%s" % (len(_winmod), sorted(_card_self_attrs),
+                                   sorted(_card_qt_attrs)))
+# 行为层：真造两个弹窗核 windowModality（不 show，只看属性）
+_pd_parent = QWidget()
+_pd = gui.ConfirmDialog(_pd_parent, "x")
+check("★有 parent ⇒ windowModality() == WindowModal",
+      _pd.windowModality() == gui.Qt.WindowModal, str(_pd.windowModality()))
+_pd2 = gui.ConfirmDialog(None, "x")
+check("★无 parent ⇒ 退回 ApplicationModal（不静默变成「谁也不拦」）",
+      _pd2.windowModality() == gui.Qt.ApplicationModal, str(_pd2.windowModality()))
+_pd.deleteLater()
+_pd2.deleteLater()
+_pd_parent.deleteLater()
+check("★五个卡片弹窗全是 `_CardDialog` 子类（模态由基类一处设，别各自 `setModal`）",
+      all(issubclass(c, gui._CardDialog) for c in
+          (gui.ConfirmDialog, gui.ChoiceDialog, gui.InputDialog,
+           gui.PresetViewDialog, gui.ApiFormDialog)))
+# ★★桌宠窗**必须没有 parent**：一旦挂上主窗，它就在主窗的 transient 子链里 ⇒ WindowModal 会连坐。
+_pet_calls = [n for n in ast.walk(_tree_main)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+              and n.func.id == "PetWindow"]
+check("★★桌宠窗没有 parent（`PetWindow(...)` 只传帧目录）——"
+      "挂上主窗就会被 WindowModal 连坐，`transientParent() is None` 这条前提就没了",
+      len(_pet_calls) == 1 and len(_pet_calls[0].args) == 1 and not _pet_calls[0].keywords,
+      str([(len(c.args), [k.arg for k in c.keywords]) for c in _pet_calls]))
+# ★上面那条只看**构造调用**；`pet.setParent(win)` 这种「事后挂父窗」照样能破坏前提（离线对照实测：
+#   变体 C3 只改这一句，上面那条**一条都不红**）⇒ 必须单独再钉一条。
+_pet_setparent = [n.lineno for n in ast.walk(_tree_main)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                  and n.func.attr == "setParent"
+                  and isinstance(n.func.value, ast.Name) and n.func.value.id == "pet"]
+check("★★main.py 里**不许** `pet.setParent(...)`（给桌宠挂父窗 ⇒ 落进主窗的 transient 子链 ⇒ "
+      "WindowModal 照样把它一起拦；而且桌宠会变成子窗，置顶 / 独立顶层窗的行为跟着变味）",
+      _pet_setparent == [], str(_pet_setparent))
 
 # ---- 行为层：真的切到「下载中」，看行上呈现什么 ----
 _orig_snap, _orig_cancel, _orig_start = _vd.snapshot, _vd.cancel, _vd.start

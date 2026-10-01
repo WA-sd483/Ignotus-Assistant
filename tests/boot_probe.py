@@ -49,6 +49,13 @@ class _FakeMic:
 _stub("app.asr", MicListener=_FakeMic, Recognizer=lambda *a, **k: object())
 _stub(
     "app.tts",
+    # ★替身必须与 `app/tts.py` 的**公开名**对齐：`main.py` 的 worker 线程会
+    #   `from .tts import DEFAULT_TEXT_LANGUAGE, ...` —— 替身少了这个名字，
+    #   线程会**静默死掉**（ImportError 只打在 stderr），表现为「AI 一直不回复」。
+    #   2026-09-30 加「回复语言」常量时漏了同步，实测让 smoke_permissions /
+    #   smoke_sleep / reply_probe 三套集体假红。
+    DEFAULT_TEXT_LANGUAGE="ja",
+    TEXT_LANGUAGE_NAMES={"zh": "中文", "en": "英语", "ja": "日语"},
     start_in_background=lambda *a, **k: None,
     set_volume=lambda *a, **k: None,
     set_muted=lambda *a, **k: None,
@@ -137,7 +144,12 @@ m.QApplication = _ShortApp
 # main() 里 is_autostart_launch() 读 sys.argv —— 这里精确控制它
 sys.argv = ["run.py"] + ([autostart.AUTOSTART_FLAG] if SILENT else [])
 
+# ★打点（`flush=True` 必须给）：本探针偶发**挂起**过（父进程 300s 超时强杀）。
+#   管道是**块缓冲**，不打点的话超时时只能看到空输出，定位不到挂在哪一步；
+#   有这两行就能一眼分辨「挂在 main() 里」还是「挂在 main() 之后」。
+print("probe: 即将跑 main()", flush=True)
 rc = m.main()
+print(f"probe: main() 已返回 rc={rc}", flush=True)
 
 win = captured["win"]
 pet = captured["pet"]

@@ -9,7 +9,8 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from .autostart import is_autostart_launch, refresh_command
 from .config import (SWITCHABLE_ROLES, get_current_api, is_role_switchable,
-                     load_config, save_config)   # ★可切换性真值（docs/02 §24）
+                     load_config, resolve_persona_text,
+                     save_config)   # ★可切换性真值（docs/02 §24）
 from .gui import MainWindow
 from .pet import PetWindow
 from .state import State
@@ -80,6 +81,73 @@ POWER_SAVE_OFF_WORDS = (
     "节能模式关掉", "把节能模式关掉", "退出节能", "关闭节能", "退出节能形态",
     "恢复正常模式", "恢复正常形态", "恢复正常", "恢复原样",
 )
+
+# ---- 「打开类」动作：交给 AI 的系统提示（2026-09-30，用户报「说『不清楚』却照样执行」）----
+# 背景：`open_path` / `open_url` / `open_app` / `search` 这四类**不在生成回复前执行** ——
+# 它们要等语音开场那一刻才执行（`_run_pending_action`，为了让窗口与回复同刻弹出）。
+# 于是以前 `action_result` 是 None：模型手里只有老师那句话，就自己发挥了，常答成
+# 「爱丽丝不太清楚呢…」，而动作**其实照做** ⇒ 用户看到的正是「说不清楚、却执行了」。
+# ⇒ 现在把「这一步会做什么」如实交给模型（前缀 `[将执行]`，含义写在 `ai._ACTION_RESULT_HINT`）。
+#    ★权限**没有**放宽：能不能执行仍由 `check_permission` 先判；这里是"已经过了权限"之后
+#      的事，只是让她的**嘴上说的**与**手上做的**对得上。
+_PENDING_ACTION_HINT = {
+    "open_path": "系统马上会帮老师打开「{label}」，与你这句话同时进行。",
+    "open_app": "系统马上会帮老师启动软件「{label}」，与你这句话同时进行。",
+    "open_url": "系统马上会在浏览器里打开老师收藏的「{label}」，与你这句话同时进行。",
+}
+
+
+def _pending_action_hint(action) -> str:
+    """把「打开类」动作翻译成交给 AI 的系统提示（空串 = 不告诉 AI）。
+
+    ★`search` 是**兜底分支**（`tools._resolve_open`：本地、收藏夹里都没找到这个软件 /
+      文件夹 / 网址）—— 这时候要的正是用户那句「说不清楚、并说帮老师在浏览器搜索」，
+      所以单独写一条、把话**说死**（模型很容易自由发挥成"我不认识这个"）。
+    ★其余三类是"确实能打开"，提示模型**别再说做不到 / 不清楚**。
+    """
+    atype = str((action or {}).get("type") or "")
+    if atype == "search":
+        kw = str((action or {}).get("keyword") or "").strip()
+        return (f"[将执行] 系统在本地和收藏夹里都没有找到「{kw}」这个软件 / 文件夹 / 网址，"
+                f"马上会在浏览器里搜索「{kw}」，与你这句话同时进行。"
+                "请如实告诉老师你没有找到，并说你会帮老师在浏览器里搜索。")
+    tpl = _PENDING_ACTION_HINT.get(atype)
+    if not tpl:
+        return ""
+    label = str((action or {}).get("label") or "")
+    return "[将执行] " + tpl.format(label=label) + "请用你的语气确认你这就去做。"
+
+
+# ---- 唤醒后的「主动打招呼」提示词（2026-09-30，用户报「初次唤醒太单调、老是同一句」）----
+# ★为什么要**轮流换角度 + 把上次那句回带**：这条 `_ask_ai` 走 `add_user_to_history=False`
+#   （招呼不进历史），所以模型看不见自己上次说了什么 —— 上下文**完全相同**时它会稳定地
+#   给出同一句，于是每次唤醒都听见一样的开场。两个保险叠加：
+#   ① 角度按**轮转**取（不是随机）：相邻两次唤醒**必然**换一个角度；
+#   ② 把上次实际说过的那句回带给它，明确要求换一种说法。
+#   （随机也想过，但随机**允许**连着两次撞同一个角度 —— 用户要的正是"别再重复"。）
+_WAKE_GREET_ANGLES = (
+    "这次请换一个话题开场，别只问好（例如问问老师今天想让你做点什么）。",
+    "这次请用游戏里「接到新任务」那样的精神头打一声招呼。",
+    "这次请顺口提一件你最近在玩 / 在做的事，再问老师。",
+    "这次请先喊一声老师，再问问老师今天过得怎么样。",
+    "这次请带点撒娇的味道，说一句你一直想对老师说的话。",
+    "这次请装作刚睡醒、伸个懒腰的样子跟老师说话。",
+)
+
+
+def wake_greeting_prompt(last: str = "", index: int = 0) -> str:
+    """组装「老师把你唤醒了、主动打个招呼」这一轮的提示词（见 `_WAKE_GREET_ANGLES`）。
+
+    `last` = 上一次**实际说过**的招呼（空串 = 第一次唤醒）；`index` = 轮转号（调用方递增）。
+    """
+    angle = _WAKE_GREET_ANGLES[index % len(_WAKE_GREET_ANGLES)]
+    parts = ["（老师刚刚叫了你的名字把你唤醒，请用你的人设和语气主动向老师打个招呼问好。",
+             angle]
+    if last:
+        parts.append(f"★上一次你是这样打招呼的：「{last[:80]}」—— 这次**换一种完全不同的说法**，"
+                     "不要重复上次那句、也不要只改几个字。")
+    parts.append("）")
+    return "".join(parts)
 
 
 class _TextBridge(QObject):
@@ -449,6 +517,12 @@ def main() -> int:
     #   ⇒ 有了 `awake`，唤醒流程的成立条件就从「不在聆听」收紧成「**还没醒**」；
     #     醒着时再喊唤醒词 = 一句普通的话，走正常交流（用户 2026-09-27 拍板）。
     awake = {"v": False}
+    # 「唤醒主动打招呼」这一轮的状态（2026-09-30，见 `wake_greeting_prompt`）：
+    #   pending = 当前这一轮回复就是唤醒招呼（`on_reply_done` 据此把它记下来）；
+    #   last    = 上一次**实际说过**的招呼原文（回带给模型，要求换一种说法）；
+    #   index   = 轮转号，每唤醒一次 +1（保证相邻两次换角度）。
+    # ★只活在内存里、**不落盘**：重启后从"第一次唤醒"重新开始，符合直觉。
+    greet_ui = {"pending": False, "last": "", "index": 0}
     listener = None  # 退出时用于停止麦克风监听
 
     def strip_punct(text: str) -> str:
@@ -611,7 +685,7 @@ def main() -> int:
         # 保持 thinking 状态（合成语音期间仍显示「正在思考...」），不提前切 speaking
         # 后台合成日语语音；合成完成后（经信号切回主线程）再切说话态、同步显示文字 + 播放声音
         try:
-            from .tts import synthesize_with_bang, is_muted
+            from .tts import DEFAULT_TEXT_LANGUAGE, synthesize_with_bang, is_muted
 
             def synth_worker():
                 # 静音（点击喇叭 / 音量=0）或「静音模式」时跳过合成，加快回复速度；否则一定走合成
@@ -619,7 +693,9 @@ def main() -> int:
                     tts_ready_bridge.ready.emit(key, zh, ja, "")
                     return
                 if ja:
-                    tmp = synthesize_with_bang(key, ja, text_language="ja")
+                    # ★主语言取自 `tts.DEFAULT_TEXT_LANGUAGE`（= 「回复语言」的唯一真值），
+                    #   别在这儿再写一次 "ja" —— 那会让「设定卡」页显示的语言与实际合成的不一致。
+                    tmp = synthesize_with_bang(key, ja, text_language=DEFAULT_TEXT_LANGUAGE)
                 else:
                     # 日语缺失（AI 输出纯中文）：用中文兜底合成，保证有声音
                     tmp = synthesize_with_bang(key, zh, text_language="zh")
@@ -810,6 +886,13 @@ def main() -> int:
     def on_reply_done(key: str, zh: str, ja: str, api_name: str = ""):
         """整段回复已完整：存下完整中文、写 API 历史。**不建气泡** —— 气泡留给
         `on_speak_started`（文字要与声音同刻出现）；这里只备好文字，并挂一道兜底。"""
+        # 这一轮若是「唤醒打招呼」：把**实际说出**的话记下来（供下次唤醒避免重复）。
+        # ★放在最前面（连下面「API 被切走」那条提前 return 之前）—— 否则标记会一直挂着，
+        #   下一条完全不相干的回复会被当成"招呼"记进去，反而让下次唤醒躲错句子。
+        if greet_ui["pending"]:
+            greet_ui["pending"] = False
+            if zh:
+                greet_ui["last"] = zh
         # 回复回来后若当前 API 已经换人，直接丢弃这条回复（同一时刻只有「当前 API」参与对话）
         if api_name and api_name != cfg.get("current_api"):
             thinking_ui["pending"] = False
@@ -844,7 +927,7 @@ def main() -> int:
         `canned=(中文, 日语)` = **不经过 AI**：直接把这两句丢进同一条流水线（危险操作排程用，
         见 `DANGER_REPLY`）。所以这一条**不需要 API Key**，也不受「API 被切走」那条守卫影响。
         """
-        from .ai import chat_once, chat_stream, load_persona, set_usage_sink  # 延迟导入 openai
+        from .ai import chat_once, chat_stream, set_usage_sink  # 延迟导入 openai
         # 把「一次对话用掉多少 token」接到本地累计上（落 `stats.json`）。
         # ★读的是响应里**本来就会返回**的 usage，不发新请求、不额外耗 token；
         #   重复设置同一个出口是幂等的（每次回复设一遍，省掉「只在启动时装一次」的时序问题）。
@@ -856,7 +939,12 @@ def main() -> int:
             win.add_system_message("（未配置 API Key，请先在左侧点击铅笔 → 管理 API）")
             back_to_listening()
             return
-        persona = None if canned else load_persona(BASE_DIR / cfg["roles"][key]["persona"])
+        # ★人设在这里**不再读文件**（2026-09-30 晚，「设定卡」可切换）：取值统一走
+        #   `config.resolve_persona_text` —— `load_config` 已经把该字段解析成人设**全文**，
+        #   这里再过一遍是**兜底**（探针/测试会直接塞一份带路径的 cfg 进来，不该因此拿到
+        #   一句「persona/alice.md」当 system prompt）。★唯一入口，别在别处再写第二份读法。
+        #   切换即时生效：每轮回复都重新读一次 cfg，**下一句就用新设定**。
+        persona = None if canned else resolve_persona_text(cfg["roles"][key]["persona"])
         history = ai_history.setdefault(key, [])
         if add_user_to_history:
             history.append({"role": "user", "content": text})
@@ -878,7 +966,7 @@ def main() -> int:
 
         def worker():
             from .pipeline import SpeakPipeline
-            from .tts import is_muted, play_wav, synthesize_with_bang
+            from .tts import DEFAULT_TEXT_LANGUAGE, is_muted, play_wav, synthesize_with_bang
 
             # 上一条还在播 → 先掐掉，避免两段语音叠在一起
             prev = pipeline_state.get("pipe")
@@ -901,7 +989,7 @@ def main() -> int:
             reply_silent["v"] = silent
 
             zh_holder = {"zh": ""}       # 中文吐完后的完整文本（on_started 拿它建气泡）
-            lang = {"v": "ja"}           # 日语缺失时的中文兜底合成
+            lang = {"v": DEFAULT_TEXT_LANGUAGE}   # 日语缺失时翻成 "zh" 走中文兜底合成
             ja_issued = {"v": False}     # 日语整段是否已经提交合成
             done_seen = {"v": False}
 
@@ -1140,6 +1228,13 @@ def main() -> int:
                     else:
                         # 打开类：暂存，等语音开始播放时同步执行
                         pending_action["action"] = action
+                        # ★★2026-09-30（用户报「打开文件夹/网站时会说『不清楚』却照样执行」）：
+                        #   这一支**现在还没执行**，所以以前 `action_result` 是 None —— 模型手里
+                        #   只有老师那句话，就自己发挥（常答成"爱丽丝不太清楚…"），而动作其实
+                        #   照做（`_run_pending_action` 在语音开场时执行）⇒ **言行不一致**。
+                        #   这里把"马上要做什么"如实交给模型（见 `_pending_action_hint`）。
+                        #   ★执行时机**没有变**（仍是语音开场时同步执行），也不是放宽权限。
+                        action_result = _pending_action_hint(action)
                         # 「打开软件」→ 桌宠进入节能形态待机，免得压住刚打开的窗口
                         # （用户要求）。权限已在上一步校验通过，这里只是提前把桌宠让开。
                         if action.get("type") == "open_app":
@@ -1194,11 +1289,17 @@ def main() -> int:
                 gname = cfg["roles"][key]["name"]
                 thinking_ui["pending"] = True
                 QTimer.singleShot(1500, lambda: _show_thinking_delayed(gname))
+                # 唤醒招呼：提示词**轮转换角度 + 回带上次那句**（见 `wake_greeting_prompt`）。
+                # 修的是用户 2026-09-30 报的「初次唤醒太单调、出现重复同一句话」——
+                # 招呼不进历史（`add_user_to_history=False`），所以必须**主动把上次那句喂回去**，
+                # 否则模型在完全相同的上下文里会稳定地给出同一句。
+                greet_ui["pending"] = True
                 _ask_ai(
                     key,
-                    "（老师刚刚叫了你的名字把你唤醒，请用你的人设和语气主动向老师打个招呼问好。）",
+                    wake_greeting_prompt(greet_ui["last"], greet_ui["index"]),
                     add_user_to_history=False,
                 )
+                greet_ui["index"] += 1
             return
         # 已唤醒（聆听中）：唤醒词**不再有特殊含义**，一律当普通说话。
         # ★两条路都走 `on_command`，但**进入条件不同**，别图省事合并成只看 `awake`：

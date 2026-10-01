@@ -10,8 +10,8 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
-    QCursor, QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QLinearGradient, QPainter,
-    QPainterPath, QPen, QPixmap, QRegion, QTransform,
+    QCursor, QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QLinearGradient,
+    QPainter, QPainterPath, QPen, QPixmap, QRegion, QTransform,
 )
 from PySide6.QtWidgets import (
     QComboBox,
@@ -63,7 +63,9 @@ DLG_BTN_RUN_TEXT = "立刻执行"       # 通用文案：关机 / 重启 / 注�
 DLG_BTN_CANCEL_TEXT = "取消"
 
 from .config import (DEFAULT_BASE_URL, DEFAULT_MODEL,
-                     is_role_switchable, save_config)   # ★is_role_switchable：角色的可切换性真值（docs/02 §24）
+                     is_role_switchable, resolve_persona_text, save_config)
+# ★is_role_switchable：角色的可切换性真值（docs/02 §24）
+# ★resolve_persona_text：人设取值的**唯一入口**（「查看」弹窗用它，别再自己读文件；docs/02 §25.17）
 from .volume import VolumeSlider, VolumeStepButton
 from .state import State
 from . import voice_model
@@ -570,13 +572,44 @@ _CARD_DANGER_QSS = (
     "QPushButton#dangerBtn { background:transparent; color:#C0392B; border:1px solid #C0392B; border-radius:8px; }"
     "QPushButton#dangerBtn:hover { background:#FDEDEC; }"
 )
+# 「查看」预设弹窗里的内容框（2026-09-30）：输入框那套「`#F6FAFF` 底 + `#7DD3FC` 描边」
+# 用在**多行**文本框上的样子。★圆角取 **12px**（design.md 4.2 卡片那一档）而不是输入框的
+# 15px 胶囊 —— 15px 圆角套在几百像素高的大框上，两端会鼓出来。
+_PRESET_BOX_QSS = (
+    "QFrame#presetFieldBox { background:#F6FAFF; border:1px solid #7DD3FC; border-radius:12px; }"
+    "QFrame#presetFieldBox QLabel { background:transparent; }"
+)
 
 
 class _CardDialog(QDialog):
-    """卡片弹窗公共基类：只提供「自下而上淡入」的入场动画（四款弹窗同一条）。
+    """卡片弹窗公共基类：窗口模态 + 「自下而上淡入」的入场动画（四款弹窗同一条）。
 
     子类照旧自己管窗口标志与卡片内容；`exec()` / `result()` 等 QDialog 接口沿 MRO 原样可用。
+
+    ★★**窗口模态只锁父窗**（2026-10-01 用户报「主界面一弹窗，桌宠就点不动了」）：
+      * `setModal(True)` == `Qt.ApplicationModal` ⇒ **整个应用的所有顶层窗一起被拦** ——
+        桌宠窗虽然跟弹窗**没有**父子关系，也照样被 `EnableWindow(hwnd, FALSE)`。
+        真机量到的印记（`tests/probe_modal_pet_input.py`，真 windows 平台看 `IsWindowEnabled`）：
+        `ApplicationModal` 下主窗与桌宠窗的 HWND **双双变 False** ⇒ 左键摸头 / 右键菜单全废。
+      * `Qt.WindowModal` 的判据（`QGuiApplicationPrivate::isWindowBlocked`，Qt 源码）是
+        「从**被查询窗**沿 transient 父链上溯，看链上有没有窗是**模态窗的祖先**」⇒
+          主窗 = 弹窗的 transient 父窗（`dlg.transientParent() is mainWin`）⇒ **被拦** ✔
+          桌宠窗 `transientParent() is None` ⇒ **不在那条链上** ⇒ **不拦** ✔
+        （真机量过：`WindowModal` 下主窗 False、桌宠窗 True。）
+      * ★**前置条件：弹窗必须有 parent** —— parent 为 None 时模态窗没有祖先可挂，
+        WindowModal **谁也拦不住**（比 ApplicationModal 还松）⇒ 兜底退回 ApplicationModal，
+        宁可多拦也不静默不拦。
+    ★⚠️ 别退回 `setModal(True)`：它会连桌宠一起拦掉，且**测试抓不到**
+      （QTest 的合成点击**绕不过**模态，见 `tests/probe_modal_pet_input.py` 的说明）。
     """
+
+    MODALITY = Qt.WindowModal
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowModality(
+            self.MODALITY if parent is not None else Qt.ApplicationModal
+        )
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -590,7 +623,6 @@ class ConfirmDialog(_CardDialog):
 
     def __init__(self, parent, message: str, confirm_text: str = "确认", cancel_text: str = "取消"):
         super().__init__(parent)
-        self.setModal(True)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFixedWidth(self.CARD_W)
@@ -652,7 +684,6 @@ class ChoiceDialog(_CardDialog):
 
     def __init__(self, parent, message: str, choices, cancel_text: str = "取消"):
         super().__init__(parent)
-        self.setModal(True)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFixedWidth(self.CARD_W)
@@ -716,7 +747,6 @@ class InputDialog(_CardDialog):
 
     def __init__(self, parent, title: str, label: str, default: str = "", password: bool = False):
         super().__init__(parent)
-        self.setModal(True)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFixedWidth(360)
@@ -777,6 +807,116 @@ class InputDialog(_CardDialog):
         if dlg.exec() == QDialog.Accepted:
             return dlg._result, True
         return "", False
+
+
+class PresetViewDialog(_CardDialog):
+    """「查看」预设弹窗（**540×460**，2026-09-30 定稿）。
+
+    用户口径：内部显示「角色背景设定 / 说话风格 / 口癖 / 称呼 / 回复语言」五项，
+    **每项内容用一个文本框框住**；内容基本较长 ⇒ 弹窗可下拉（右侧给滚动条留位、下侧留位放
+    「关闭」按钮）。
+
+    - 与另外四款弹窗**共用同一张卡片皮肤**（`_CARD_FRAME_QSS` / `_CARD_BTN_QSS`，design.md 4.5），
+      只是尺寸按用户口径放大到 540×460。
+    - 「回复语言」由调用方算好传进来（它不在人设文件里，见 `_PRESET_FIELDS` 上方的注释）。
+    - ★★**唯一的关法是底部那颗「关闭」按钮**（2026-09-30 用户拍板）。
+      同日晚些时候曾做过「点弹窗外也关闭」，**已按用户要求整块删除** —— 三层机制
+      （应用级 `eventFilter` + 给透明边涂 `alpha=1` + `mousePressEvent` 几何兜底）都撤了；
+      连带 `OUTER` 那圈 12px 透明边也不再需要：**窗口 = 卡片**（540×460），窗口里没有"外面"。
+      ⇒ **别再加回来**（`docs/02 §25.6` 记着它当时为什么不好使）。
+    """
+
+    CARD_W, CARD_H = 540, 460
+    BTN_W, BTN_H = 88, 34
+
+    def __init__(self, parent, name: str, rows):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(self.CARD_W, self.CARD_H)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        card = QFrame()
+        card.setObjectName("confirmCard")        # ★沿用四款弹窗那张卡片的 objectName
+        card.setFixedSize(self.CARD_W, self.CARD_H)
+        self._card = card
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(24, 20, 24, 20)
+        card_lay.setSpacing(14)
+
+        # 标题 = 预设命名（看的人要能一眼确认"这是哪一套设定"）
+        title = QLabel(str(name))
+        title.setWordWrap(True)
+        title.setStyleSheet(
+            "font-size:15px; font-weight:bold; color:#0C447C; background:transparent;"
+        )
+        card_lay.addWidget(title)
+
+        # 滚动区：复用面板那套（`_SmoothScrollBar` 胶囊条 + 垂直常驻位 + body 右留 8px 呼吸位）
+        _scroll, _body, body_lay = _panel_scroll(card_lay)
+        body_lay.setSpacing(14)
+        for label, text in rows:
+            body_lay.addWidget(self._build_field(label, text))
+        body_lay.addStretch(1)
+
+        # 底部：下侧留出放「关闭」的空间（按钮右对齐，与另外四款同一条排法）
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        btn_row.addStretch(1)
+        close_btn = QPushButton("关闭")
+        close_btn.setObjectName("confirmBtn")
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setFixedSize(self.BTN_W, self.BTN_H)
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(close_btn)
+        card_lay.addLayout(btn_row)
+
+        outer.addWidget(card)
+        self.setStyleSheet(_CARD_FRAME_QSS + _CARD_BTN_QSS + _PRESET_BOX_QSS)
+
+    @staticmethod
+    def _build_field(label: str, text: str) -> QWidget:
+        """一项 = 「小标题 + 一个框住内容的文本框」。
+
+        ★文本框用 `QFrame` + `QLabel(wordWrap)`，**不用 `QTextEdit`**：阅读用的只读文本
+          不需要自己的滚动条 / 光标，而且 `QTextEdit` 必须钉死高度 —— 内容长的要单独滚、
+          短的会空一大块，跟「整页一起下拉」的口径冲突。
+        ★长内容必须能换行（`setWordWrap(True)`）且**横向策略 `Ignored`**：滚动区是
+          `widgetResizable` + 关掉了水平滚动条，不换行的长文本会把内容区最小宽度顶到视口之外
+          —— 整块被裁掉右边一截（`_SettingRow` / `_hint_tip` 都踩过这个坑）。
+          ★改策略时**基于现有 policy 改**（不要 `setSizePolicy(新对象)`）：`QLabel.setWordWrap`
+            会带上 `heightForWidth`，换一个全新 policy 会把那个标志丢掉 ⇒ 多行文本只剩一行高。
+        """
+        wrap = QWidget()
+        wrap.setStyleSheet("background:transparent;")
+        v = QVBoxLayout(wrap)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+
+        head = QLabel(label)
+        head.setStyleSheet("font-weight:bold; color:#334155; background:transparent;")
+        v.addWidget(head)
+
+        box = QFrame()
+        box.setObjectName("presetFieldBox")
+        box_lay = QVBoxLayout(box)
+        box_lay.setContentsMargins(12, 8, 12, 8)
+        body = QLabel(text)
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(Qt.TextSelectableByMouse)   # 只读，但允许选中复制
+        pol = body.sizePolicy()
+        pol.setHorizontalPolicy(QSizePolicy.Ignored)
+        body.setSizePolicy(pol)
+        body.setStyleSheet("color:#334155; font-size:13px; background:transparent;")
+        box_lay.addWidget(body)
+        v.addWidget(box)
+        return wrap
+
+    @staticmethod
+    def view(parent, name: str, rows):
+        dlg = PresetViewDialog(parent, name, rows)
+        dlg.exec()
 
 
 class DangerCountdownDialog(QDialog):
@@ -2124,6 +2264,418 @@ class WakeWordPanel(_MessagePanel, QWidget):
                 save_config(self.cfg)
                 self._msg(f"已删除「{word}」。", error=False)
                 self._rebuild()
+
+# ========== 设定卡（管理区第 3 页，2026-09-30）==========
+#
+# 页面口径（用户 2026-09-30 口述整理）：
+# - 左栏管理导航新增「设定卡」，**排在最后**（管理 API → 管理唤醒词 → 设定卡）。
+# - 右栏内容 = **只有「预设」一个区块**（五个展示项不铺在页面上，点「查看」才看）。
+#   将来会加「自定义」区块，**接在预设下面**；★被选中的那张预设卡**不挪位置**
+#   （不能因为"当前项要排前面"而重排 —— 顺序恒等于配置里的列表顺序）。
+# - 预设卡：最左单选框 / 中间预设命名 / 最右蓝底白字「查看」。
+#   ★★**整张卡点得动 = 切到这张预设**（2026-09-30 晚用户口径：「点整张卡或圆点都可以切换，
+#     但点击右侧的按钮不会切换」）—— 卡片仍是**不可编辑、不可删除**的（编辑随"自定义"一起做）。
+#     ★页面标题右上角那颗圆点只是"当前选中"的显示，点击由卡片统一处理（圆点不吃鼠标）。
+# - 「查看」弹窗 540×460（2026-09-30 二次改版：高度再 −20）：五个展示项各用一个文本框框住；
+#   内容较长 ⇒ 可下拉（右侧留滚动条位、下侧留位放「关闭」按钮）。
+#   ★★**唯一的关法就是那颗「关闭」**（用户 2026-09-30 拍板）：「点弹窗外关闭」那三层机制
+#     **做过、已整块删除**，`PresetViewDialog` 上不再有 `eventFilter` / `paintEvent` / `OUTER`
+#     之类的东西 —— **别再加回来**（为什么那三层不成立见 docs/02 §25.6 / §25.14）。
+# - **跟随当前角色**（与「管理唤醒词」同一套做法）：切到艾莲就显示艾莲的预设。
+# - 「回复语言」指的是**合成语音**说的语言（聊天界面恒为中文），当前固定日语、**只读**：
+#   编辑能力随自定义功能一起做（用户口径）。
+
+# ★2026-09-30 晚：卡片自带**人设全文**（`presets[*].persona`），`persona/*.md` 退化成
+#   「首次播种用的素材」—— 详见 docs/02 §25.17。取值一律走 `config.resolve_persona_text`，
+#   **不许在 gui 里拼路径、也不许自己读文件**（那正是"看着是 A、实际用的是 B"的来源）。
+
+# 「查看」弹窗里的五个展示项。前四项从人设全文按 `## 小节` 取；第五项（回复语言）
+# **不在人设文件里** —— 它是合成语音的语言，唯一真值在 `tts.DEFAULT_TEXT_LANGUAGE`，见下。
+_PRESET_FIELDS = (
+    ("background", "角色背景设定", "设定"),
+    ("style", "说话风格", "说话风格"),
+    ("verbal_tics", "口癖", "口癖"),
+    ("address", "称呼", "称呼"),
+)
+# 人设文件里没有这一条时的显示占位（**照实留空，不替角色编内容**）
+PRESET_EMPTY = "（未设置）"
+
+
+def _clean_preset_text(lines) -> str:
+    """把人设文件里的一个小节转成适合放进文本框的纯文本。
+
+    只做两件**无损的显示层**处理：行首 `- ` → `• `（**统一顶格**）、去掉 `**` 与反引号。
+    ★不改写任何字句：这一页展示的就是「当前真正在用的设定」，措辞必须原样保留。
+    ★★**子级缩进一律拍平**（2026-09-30 二次改版，用户口径「口癖里有几条的 · 和其他没对齐」）：
+      人设文件用 `  - ` 表示子项，但正文字体是**比例字体**，两个半角空格的缩进既不像"缩进"
+      也不像"没缩进"，看起来就是几个 `•` 没对齐。层级信息由人设的措辞承担
+      （「在以下两类场合」），显示层只保证**所有 `•` 落在同一条竖线上**。
+    """
+    out = []
+    for raw in lines:
+        stripped = raw.strip()
+        # 条目行：丢掉原有缩进，统一顶格；非条目行（如缩进的对齐示例）原样保留
+        line = "• " + stripped[2:] if stripped.startswith("- ") else raw.rstrip()
+        out.append(line.replace("**", "").replace("`", ""))
+    return "\n".join(out).strip("\n")
+
+
+def persona_sections_from_text(text) -> dict:
+    """把**人设全文**按 `## 小节` 拆出 `_PRESET_FIELDS` 里的四项（缺的给空串）。
+
+    ★2026-09-30 晚：「设定卡」可切换 + 卡片自带人设全文 ⇒ 本函数从"读文件"改成"吃文本"，
+      **调用方拿到的就是 `presets[*].persona` 那份全文本身**（取值走 `config.resolve_persona_text`）。
+      好处是「页面上显示的」与「实际喂给模型的」**是同一串字符**，不可能各说各话；
+      也不再需要在 `gui` 里拼路径（那只会在人设载体变化时静默失效）。
+
+    - **只认 `##` 标题**：`# 爱丽丝（《蔚蓝档案》）` 是文件大标题不是小节（遇到它即结束当前小节）。
+    - 空文本 → 四项全空串（**不抛异常**：人设是可被用户替换的素材）。
+    - ★艾莲那份**故意缺「口癖 / 称呼」**（她的人设里本来就没这两条）⇒ 解析层照实返回空串，
+      占位由调用方补 —— **别在这儿替角色编一段**，那会让"页面上显示的"与"实际喂给模型的"不一致。
+    """
+    out = {key: "" for key, _title, _head in _PRESET_FIELDS}
+    heads = {head: key for key, _title, head in _PRESET_FIELDS}
+    cur, buf = None, []
+    for line in str(text or "").splitlines():
+        if line.startswith("#"):
+            if cur is not None:
+                out[cur] = _clean_preset_text(buf)
+            cur, buf = heads.get(line.lstrip("#").strip()), []
+            continue
+        if cur is not None:
+            buf.append(line)
+    if cur is not None:
+        out[cur] = _clean_preset_text(buf)
+    return out
+
+
+def preset_language_name() -> str:
+    """「回复语言」的显示名。★唯一真值 = `tts.DEFAULT_TEXT_LANGUAGE`（不在本文件里另写一份）。
+
+    ★局部 import：`tts` 会拉起 `sounddevice` / `numpy`，gui 模块顶层不该为了一个显示名去背它
+      （本文件其它用到 tts 的地方也都是函数内 import）。
+    """
+    from .tts import DEFAULT_TEXT_LANGUAGE, TEXT_LANGUAGE_NAMES
+
+    return TEXT_LANGUAGE_NAMES.get(DEFAULT_TEXT_LANGUAGE, DEFAULT_TEXT_LANGUAGE)
+
+
+class _PresetDot(QWidget):
+    """设定卡预设卡最左侧的**实心圆单选**（自绘）。
+
+    用户口径（2026-09-30）：**外圈 1px 细线；未选中 = 空心；选中 = 内部填一个略小于
+    外圈半径的实心圆**。
+
+    ★★2026-10-01 用户口径：「设置里『关闭行为』的单选框也改成和设定卡一样」
+      ⇒ **全项目只剩这一款单选钮** —— 设定卡 + 设置页「关闭行为」共用**同一个类**。
+      旧款 `_RadioDot`（圆心**永远留白**的「两圈描边 + 中间一圈蓝环」）**已整块删除**；
+      `_RadioItem`（设置页那一行）现在直接拿这个类当圆点。
+      ⇒ **改这里的观感 = 同时改两处**。别再按调用方在 `paintEvent` 里分叉
+        （那是当初保留两个类的理由，随本轮口径作废）；也别把「圆心留白」那款加回来。
+
+    - 外径 18px（设置页「关闭行为」那行行高钉死 **58px**，两处必须同尺寸才对得齐）、
+      边框 1px、实心圆直径 12px
+      （比外圈半径 9px 小 ⇒ 留 1px 边框 + 2px 空隙，看起来才是"略小"而不是"顶满"）。
+    - 选中 ↔ 未选中是 **500ms 变色淡入淡出**（设定卡与设置页同一节奏）：着色进度 `_t` 在 0↔1
+      之间插值，外圈灰→蓝、实心圆按同一进度淡入淡出。**不要每帧 `setStyleSheet`**（会 polish + 重排）。
+    - **自己不处理鼠标、让事件穿透到卡片**（`WA_TransparentForMouseEvents`）：
+      2026-09-30 晚起**整张卡都可点切换**（用户口径：「点整张卡或圆点都可以切换」）——
+      圆点保持"纯展示、不自己写 `mousePressEvent`"，点击直接落到 `_PresetCard` 上，
+      于是「点圆点」与「点卡片」走的是**同一条**切换路径（不必在这里再写一份）。
+      ★别把 `WA_TransparentForMouseEvents` 去掉改成自己接事件：那就有了两条切换路径。
+    """
+
+    DOT = 18
+    BORDER = 1
+    SOLID = 12
+    ON = "#378ADD"          # 选中：外圈与实心圆同为主蓝
+    IDLE = "#CBD5E1"        # 未选中：只有外圈，灰（与滑块关态、行边框同色）
+    FADE_MS = 500
+
+    def __init__(self, checked: bool = False, parent=None):
+        super().__init__(parent)
+        self._checked = bool(checked)
+        # 着色进度：0 = 未选中（只画灰外圈），1 = 选中（蓝外圈 + 实心圆）。
+        # 绘制读 `_t` 而不是 `_checked`，切换才是渐变而非瞬间跳变。
+        self._t = 1.0 if self._checked else 0.0
+        self.setFixedSize(self.DOT, self.DOT)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(self.FADE_MS)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim.valueChanged.connect(self._set_t)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, on: bool, animate: bool = True) -> None:
+        """拨到选中 / 未选中。`animate=False` 直接落终态（构建期用，省一次无谓动画）。"""
+        on = bool(on)
+        if on == self._checked:
+            return
+        self._checked = on
+        target = 1.0 if on else 0.0
+        self._anim.stop()
+        if not animate:
+            self._set_t(target)
+            return
+        self._anim.setStartValue(self._t)   # 从当前进度续上，连点两次不会闪
+        self._anim.setEndValue(target)
+        self._anim.start()
+
+    def _set_t(self, value) -> None:
+        self._t = float(value)
+        self.update()
+
+    def paintEvent(self, _e):  # noqa: N802 (Qt 命名)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        s, b, t = self.DOT, self.BORDER, self._t
+        outer = QRectF(b / 2, b / 2, s - b, s - b)
+        p.setPen(QPen(_mix_color(self.IDLE, self.ON, t), b))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(outer)                 # 外圈：灰 → 蓝，全程可见
+        if t > 0.0:
+            inner = QRectF((s - self.SOLID) / 2, (s - self.SOLID) / 2, self.SOLID, self.SOLID)
+            p.setPen(Qt.NoPen)
+            p.setBrush(_fade_color(self.ON, t))
+            p.drawEllipse(inner)             # 实心圆：随进度淡入 / 淡出
+
+
+class _PresetCard(_HoverRow, QFrame):
+    """「预设」区块里的一张预设卡（2026-09-30）。
+
+    用户口径：卡片样式**类似设置界面**（= `_SettingRow` 那张卡：白底 / 圆角 10 / 1px `#CBD5E1` /
+    高 58px），自左向右依次是「实心圆单选 → 预设命名 → 蓝底白字『查看』」。
+
+    - ★★**整张卡可点 = 切换到这张预设**（2026-09-30 晚用户口径：「点整张卡或圆点都可以切换，
+      **但点击右侧的按钮不会切换**」）：
+        · 切换落在 `mouseReleaseEvent`（不是 press）—— 按下去又拖出去松手 **不算**点击，
+          判据是"松开时指针还在卡里"（`self.rect().contains(...)`）；
+        · 「点右侧按钮不切换」**天然成立**，不需要额外判断：`QPushButton` 会把落在自己身上的
+          按下/松开**自己吃掉**（它要 press+release 成对才发 `clicked`），父控件根本收不到；
+        · 圆点也一样（`WA_TransparentForMouseEvents` ⇒ 事件穿透上来），所以"点圆点"与
+          "点卡片"共用这一条路径，**没有第二份切换逻辑**。
+    - ★★**悬停效果 = 与「管理 API」/「管理唤醒词」的卡片同一条**（2026-09-30 晚·第五批，用户口径
+      「鼠标悬停时卡片的变化效果参照管理 api 和管理唤醒词里的卡片效果」）：
+      **底色 200ms 由白 `#FFFFFF` 渐到淡蓝 `#E6F1FB`，描边全程保持 `#CBD5E1`**。
+      实现方式是与 `_ApiRow` / `_WakeRow` / `_PermRow` **共用 `_HoverRow` 混入类**
+      （`_make_hover_anim` + `enterEvent` / `leaveEvent` → `_apply_bg(t)`）—— 四处视觉必须一致，
+      改一处等于改四处。
+      ★这推翻了同日早先的「只把描边染蓝、底色保持白」：那时的顾虑是「整块填色会盖过
+        『这张选中了』的实心圆观感」，实测淡蓝底上圆点的灰圈 / 蓝实心圆都还看得清
+        （对照图 `docs/screenshots/manage-preset-hover.png`）。★改需求时记得复核这条注释。
+    - ★早先还有一条「本页只有『查看』可点、不做整行 hover」的口径 —— 那条随「整卡可点」一起反转了：
+      卡片成了主操作，就必须有可点反馈。**只要卡片还能点，hover 就不能删。**
+    - 单选状态由 `checked` 参数决定、**不写死**：由调用方按「哪张是角色 `persona` 指向的那份」传值。
+      切换后**不重建卡片**，只调 `set_checked()` —— 保住那颗圆点 500ms 的变色动画
+      （重建的话新圆点直接落终态，看起来像"瞬移"）。
+    - 名称是单行 `QLabel` ⇒ 横向策略设 `Ignored` + `resizeEvent` 里按当前宽度右侧省略：
+      不这么做，长预设名会把行顶宽、把右边那颗「查看」挤出可视区（`_SettingRow` 踩过同一个坑）。
+    """
+
+    def __init__(self, name: str, checked: bool, on_view, on_switch=None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("presetCard")
+        self.setFixedHeight(58)
+        self._name_text = str(name)
+        self._on_switch = on_switch
+        self._hover = 0.0          # 0=白, 1=淡蓝（与 `_ApiRow` / `_WakeRow` 同一套）
+        # 整卡可点 ⇒ 给个"手型"，否则用户不知道点得动（「查看」那颗按钮自带同一个光标）
+        if on_switch is not None:
+            self.setCursor(Qt.PointingHandCursor)
+        hl = QHBoxLayout(self)
+        hl.setContentsMargins(16, 8, 12, 8)
+        hl.setSpacing(10)
+
+        self._dot = _PresetDot(checked)
+        hl.addWidget(self._dot, 0, Qt.AlignVCenter)
+
+        self._name = QLabel(self._name_text)
+        self._name.setStyleSheet("color:#0C447C; font-size:13px; background:transparent;")
+        self._name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        hl.addWidget(self._name, 1)
+
+        self._view_btn = QPushButton("查看")
+        self._view_btn.setObjectName("presetViewBtn")
+        self._view_btn.setCursor(Qt.PointingHandCursor)
+        # ★NoFocus：与权限页行内按钮同一条理由 —— 这类临时操作按钮不该进键盘焦点链，
+        #   否则关掉弹窗后焦点被移交给别的控件，滚动区会 ensureWidgetVisible 去追它。
+        self._view_btn.setFocusPolicy(Qt.NoFocus)
+        self._view_btn.setFixedHeight(28)
+        self._view_btn.clicked.connect(lambda _=False: on_view())
+        hl.addWidget(self._view_btn, 0, Qt.AlignVCenter)
+
+        # hover 渐变：复用 `_HoverRow` 的那条 **200ms** 动画（`valueChanged` → `_apply_bg(t)`），
+        # 与 `_ApiRow` / `_WakeRow` 同款 —— 底色白 → 淡蓝、描边不动。
+        self._hover_anim = self._make_hover_anim(200)
+        # ★布局装完之后再落一次底色：构造期就 `setStyleSheet` 会多触发一轮无用 polish。
+        self._apply_bg(0.0)
+
+    def _apply_bg(self, t: float):
+        """把 hover 强度 `t`（0 = 白 → 1 = 淡蓝）落到样式表上。
+
+        ★**与 `_ApiRow._apply_bg` / `_WakeRow._apply_bg` 是同一条插值**（白 `#FFFFFF` →
+          `#E6F1FB`）、**描边一律 `#CBD5E1`**（hover 不染蓝）、圆角同为 10px ——
+          三处必须保持一致，改一处等于改三处。
+        """
+        self._hover = float(t)
+        r = int(255 + (230 - 255) * t)
+        g = int(255 + (241 - 255) * t)
+        b = 255
+        self.setStyleSheet(
+            f"QFrame#presetCard{{background:rgb({r},{g},{b}); border:1px solid #CBD5E1; border-radius:10px;}}"
+            "QFrame#presetCard QLabel{background:transparent;}"
+            "QPushButton#presetViewBtn{background:#378ADD; color:#FFFFFF; border:none;"
+            " border-radius:8px; padding:4px 12px; font-size:12px;}"
+            "QPushButton#presetViewBtn:hover{background:#2F74BF;}"
+        )
+
+    def set_checked(self, on: bool, animate: bool = True) -> None:
+        """只拨那颗圆点（**不重建**卡片）—— 切换后保住 500ms 变色动画的入口。"""
+        self._dot.setChecked(on, animate=animate)
+
+    def mouseReleaseEvent(self, e):  # noqa: N802 (Qt 命名)
+        """松开鼠标 ⇒ 切到这张预设（★判据见类 docstring：落在「查看」上的事件收不到、不必特判）。"""
+        super().mouseReleaseEvent(e)
+        if e.button() != Qt.LeftButton:
+            return
+        # 按下去又拖到卡外才松手 ⇒ 不算点击（`QPushButton` 同一套规矩，用户习惯一致）
+        if not self.rect().contains(e.position().toPoint()):
+            return
+        if self._on_switch is not None:
+            self._on_switch()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        avail = self._name.width()
+        if avail > 0 and self._name_text:
+            # 一律拿**原文**去省略：宽度变回去时能自动还原，不会越省略越短
+            self._name.setText(
+                self._name.fontMetrics().elidedText(self._name_text, Qt.ElideRight, avail)
+            )
+
+
+class PresetPanel(_MessagePanel, QWidget):
+    """设定卡面板（管理区，2026-09-30）：显示**当前角色**的设定预设。
+
+    结构与其他管理 / 设置面板同一条：标题 → 滚动区 → 底部消息行（`_panel_bottom`）。
+    页面内容只有「预设」一个分组（`_group_header`）—— 将来的「自定义」区块接在它**下面**。
+    ★卡片顺序 = 配置里的列表顺序，**选中态不改变位置**（用户口径）。
+    """
+
+    def __init__(self, cfg, role_key, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.role_key = role_key
+        self._cards = []      # 当前页上的卡片引用，切换后只拨圆点、**不重建**（见 `_sync_checked`）
+        self._build()
+        self._apply_style()
+        self._rebuild()
+
+    def set_role(self, role_key):
+        """跟随当前角色（与 `WakeWordPanel.set_role` 同一套做法）。"""
+        self.role_key = role_key
+        self._rebuild()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        # 与 4.11 / 4.13 同一套底部尺寸：底边距 4 + 消息行前间距 4 + 消息行 16 = 24px
+        lay.setContentsMargins(24, 20, 24, TAIL_BOTTOM)
+        lay.setSpacing(14)
+        _panel_title(lay, "设定卡")
+        self._scroll, self._body, self._body_lay, self._msg_label = _panel_bottom(lay)
+
+    def _apply_style(self):
+        self.setStyleSheet("QWidget { background:#FFFFFF; color:#334155; font-size:13px; }")
+
+    def _role(self) -> dict:
+        role = self.cfg.get("roles", {}).get(self.role_key)
+        return role if isinstance(role, dict) else {}
+
+    def _presets(self) -> list:
+        presets = self._role().get("presets")
+        return presets if isinstance(presets, list) else []
+
+    def current_name(self) -> str:
+        """**哪张卡是选中的**：presets 里 `persona` == 角色 `persona` 的那一张。
+
+        ★判据只用「当前生效的人设」这一个事实（见 `config.DEFAULT_CONFIG` 里 roles 的注释）
+          —— 不引入 `current_preset` 之类的第二份状态：两份状态一旦漂移，
+          页面上显示的是这一份、实际用的是那一份，而且**不会有任何报错**。
+        ★两边都是**人设全文**（`config.resolve_persona_text` 在 `load_config` 里统一解析过），
+          **逐字相等**才算选中 —— 所以「切换」只要把那串文本写进 `role["persona"]` 就完事，
+          本函数**一个字都不用改**。
+        """
+        current = str(self._role().get("persona") or "").strip()
+        for item in self._presets():
+            if isinstance(item, dict) and str(item.get("persona") or "").strip() == current:
+                return str(item.get("name") or "")
+        return ""
+
+    def refresh(self):
+        self._rebuild()
+
+    def _rebuild(self):
+        _clear_body(self._body_lay)
+        self._cards = []
+        _group_header(self._body_lay, "预设")
+        presets = [p for p in self._presets() if isinstance(p, dict)]
+        if not presets:
+            _hint_tip(self._body_lay, "当前角色还没有预设。")
+            return
+        current = self.current_name()
+        for item in presets:
+            name = str(item.get("name") or "")
+            card = _PresetCard(
+                name, name == current,
+                lambda n=name, i=item: self._on_view(n, i),
+                on_switch=lambda i=item: self._on_switch(i),
+            )
+            self._cards.append(card)
+            self._body_lay.addWidget(card)
+        self._body_lay.addStretch(1)
+
+    def _on_switch(self, item):
+        """点卡片（或圆点）⇒ **把这张预设切为当前使用**（2026-09-30 晚；本页从"只读"变成有交互）。
+
+        写回的是 `role["persona"]` —— 它同时是「哪张卡选中」的**唯一判据**（不设第二份指针）；
+        而 `main.py` 每轮回复都重新读一次 cfg ⇒ **下一句话就用新设定**，不必重启。
+        ★已经是这张 ⇒ **直接返回、不写盘**（否则"点一下当前那张"也会产生一次磁盘写 + 一条回执）。
+        ★卡内容为空 ⇒ 只提示、不切（切过去等于把 system prompt 变空，模型会丢掉全部人设）。
+        ★落盘走 `save_config`：这一步把**人设全文**写进 `config.json`，此后运行时就
+          **不再读 `persona/*.md`** 了（用户口径"直接读设定卡"；取舍见 docs/02 §25.17）。
+        """
+        name = str(item.get("name") or "")
+        text = resolve_persona_text(item.get("persona"))
+        role = self._role()
+        if not text:
+            self._msg(f"「{name}」没有内容，不能切换。", error=True)
+            return
+        if text == str(role.get("persona") or ""):
+            return
+        role["persona"] = text
+        save_config(self.cfg)
+        self._sync_checked()
+        self._msg(f"已切换到「{name}」。", error=False)
+
+    def _sync_checked(self):
+        """按当前 cfg **只拨圆点**（不重建卡片）⇒ 卡片顺序、滚动位置都不动，还保住变色动画。"""
+        current = self.current_name()
+        for card in getattr(self, "_cards", []):
+            card.set_checked(card._name_text == current)
+
+    def _on_view(self, name, item):
+        """「查看」：把**这张卡自带的人设全文**里的四条 + 「回复语言」装进弹窗。
+
+        ★内容与实际喂给模型的**是同一串字符**（都取自 `presets[*].persona`）⇒
+          这一页不可能出现"看着是 A、实际用的是 B"。
+        """
+        fields = persona_sections_from_text(resolve_persona_text(item.get("persona")))
+        rows = [(title, fields.get(key) or PRESET_EMPTY) for key, title, _head in _PRESET_FIELDS]
+        rows.append(("回复语言", preset_language_name()))
+        PresetViewDialog.view(self, name, rows)
+
 
 # ========== 权限管理面板 ==========
 
@@ -3720,106 +4272,25 @@ class _SettingToggleRow(_SettingRow):
         return self._switch.is_locked()
 
 
-class _RadioDot(QWidget):
-    """**圆环型单选**（自绘）。
+# ---- 自绘小控件的颜色插值（`_PresetDot` 用；`_RadioDot` 已于 2026-10-01 整块删除）----
 
-    用户口径（2026-09-18）：**圆环有内外两层边框** —— 选中时两条边框都画、且**两条边框之间
-    出现蓝色圆环**；未选中时**只显示最外层边框**。
+def _mix_color(c1, c2, t):
+    """两个颜色按 t 插值（t=0 → c1，t=1 → c2）。"""
+    a, z = QColor(c1), QColor(c2)
+    return QColor(round(a.red() + (z.red() - a.red()) * t),
+                  round(a.green() + (z.green() - a.green()) * t),
+                  round(a.blue() + (z.blue() - a.blue()) * t))
 
-    - 外径 **18px**、边框 **1px**、内圈外径 **7px**（`INNER`，即半径 3.5px）。
-    - **切换选中是 500ms 的变色淡入淡出**（`FADE_MS`）：自绘的着色进度 `_t` 由
-      `QVariantAnimation` 在 0（未选中）↔ 1（选中）之间插值 —— 外圈颜色灰 `#CBD5E1` → 深蓝
-      `#0C447C` 渐变，中间的蓝环与内圈描边按同一进度淡入（反向切换则是淡出）。
-      **不要**改用 `QGraphicsOpacityEffect`：18px 的小控件没必要多挂一条渲染链，而行高是钉死的
-      58px，掉一帧就看得出来。也不要每帧 `setStyleSheet`（会 polish → 布局重排）。
-    - 选中：外圈 / 内圈都描 `#0C447C`（深蓝），两圈之间填 `#378ADD`（主蓝），**圆心留白**；
-      画法是「先整颗填蓝、再把内圈挖成白色、最后描两圈」—— 一次成型，不用算环带路径。
-    - 未选中：只有最外圈，描 `#CBD5E1`（与滑块关态、行边框同色）。
-    - **必须自绘**：QSS 的 `border-radius` 做不出「两层边框 + 中间一圈色」，而且 QSS 会在
-      polish 时重排（`_SettingRow` 的行高是钉死的 58px，闪一下就看得出）。
-    - 不吃鼠标事件（`WA_TransparentForMouseEvents`）：点击由外层 `_RadioItem` 整块接管。
-    """
 
-    DOT = 18
-    BORDER = 1          # 圆环边框粗细（2026-09-18：1.5px → 1px）
-    INNER = 7           # 内圈外径（2026-09-18：9px → 4.5px → 7px，用户两次指定）
-    RING = "#378ADD"
-    INK = "#0C447C"
-    IDLE = "#CBD5E1"
-    FADE_MS = 500        # 选中 ↔ 未选中的变色淡入淡出时长（2026-09-18：200 → 500）
-
-    def __init__(self, checked: bool = False, parent=None):
-        super().__init__(parent)
-        self._checked = bool(checked)
-        # 着色进度 `_t`：0 = 未选中态（只画外圈、灰），1 = 选中态（蓝环 + 双层深蓝边框）。
-        # 绘制读 `_t` 而不是 `_checked`，切换才是渐变而非瞬间跳变。
-        self._t = 1.0 if self._checked else 0.0
-        self.setFixedSize(self.DOT, self.DOT)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self._anim = QVariantAnimation(self)
-        self._anim.setDuration(self.FADE_MS)
-        self._anim.setEasingCurve(QEasingCurve.OutCubic)
-        self._anim.valueChanged.connect(self._set_t)
-
-    def isChecked(self) -> bool:
-        return self._checked
-
-    def setChecked(self, on: bool, animate: bool = True) -> None:
-        """拨到选中 / 未选中。`animate=False` 直接落终态（构建期用，省一次无谓动画）。"""
-        on = bool(on)
-        if on == self._checked:
-            return
-        self._checked = on
-        target = 1.0 if on else 0.0
-        self._anim.stop()
-        if not animate:
-            self._set_t(target)
-            return
-        self._anim.setStartValue(self._t)   # 从当前进度续上，连点两次不会闪
-        self._anim.setEndValue(target)
-        self._anim.start()
-
-    def _set_t(self, value) -> None:
-        self._t = float(value)
-        self.update()
-
-    @staticmethod
-    def _blend(c1, c2, t):
-        """两个颜色按 t 插值（t=0 → c1，t=1 → c2）。"""
-        a, z = QColor(c1), QColor(c2)
-        return QColor(round(a.red() + (z.red() - a.red()) * t),
-                      round(a.green() + (z.green() - a.green()) * t),
-                      round(a.blue() + (z.blue() - a.blue()) * t))
-
-    @staticmethod
-    def _fade(c, t):
-        """同色，整体不透明度 = t。"""
-        col = QColor(c)
-        col.setAlphaF(max(0.0, min(1.0, float(t))))
-        return col
-
-    def paintEvent(self, _e):  # noqa: N802 (Qt 命名)
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        s, b, t = self.DOT, self.BORDER, self._t
-        outer = QRectF(b / 2, b / 2, s - b, s - b)
-        inner = QRectF((s - self.INNER) / 2, (s - self.INNER) / 2, self.INNER, self.INNER)
-        if t > 0.0:
-            p.setPen(Qt.NoPen)
-            p.setBrush(self._fade(self.RING, t))
-            p.drawEllipse(outer)             # 整颗填蓝（按进度淡入）
-            p.setBrush(QColor("#FFFFFF"))    # 圆心挖白：纯白，与行底同色，进度为 0 时不画
-            p.drawEllipse(inner)
-        p.setPen(QPen(self._blend(self.IDLE, self.INK, t), b))
-        p.setBrush(Qt.NoBrush)
-        p.drawEllipse(outer)                 # 外边框：灰 → 深蓝，全程可见
-        if t > 0.0:
-            p.setPen(QPen(self._fade(self.INK, t), b))
-            p.drawEllipse(inner)             # 内边框：随进度淡入 / 淡出
+def _fade_color(c, t):
+    """同色，整体不透明度 = t（超出 0~1 会被夹住）。"""
+    col = QColor(c)
+    col.setAlphaF(max(0.0, min(1.0, float(t))))
+    return col
 
 
 class _RadioItem(QWidget):
-    """一个选项 = **圆环 + 文字**，整块可点（点文字等同点圆环）。"""
+    """一个选项 = **实心圆单选 + 文字**，整块可点（点文字等同点圆点）。"""
 
     clicked = Signal()
 
@@ -3829,7 +4300,7 @@ class _RadioItem(QWidget):
         hl = QHBoxLayout(self)
         hl.setContentsMargins(0, 0, 0, 0)
         hl.setSpacing(6)
-        self._dot = _RadioDot(checked)
+        self._dot = _PresetDot(checked)      # ★2026-10-01：与设定卡同一个类（实心圆）
         self._lbl = QLabel(str(text))
         self._lbl.setStyleSheet("color:#334155; font-size:13px; background:transparent;")
         # 文字不吃鼠标事件：点击透给本控件，整块算一次点击
@@ -3850,10 +4321,12 @@ class _RadioItem(QWidget):
 
 
 class _SettingChoiceRow(_SettingRow):
-    """互斥选项行：右侧一排**圆环单选**（如「最小化到托盘 / 关闭软件」）。
+    """互斥选项行：右侧一排**实心圆单选**（如「最小化到托盘 / 关闭软件」）。
 
-    2026-09-18 用户口径：原来是「蓝底 / 蓝边」胶囊按钮，改成圆环型单选 ——
-    环的规格见 `_RadioDot`，选中态由**圆环**表达，文字两侧不再有底色。
+    2026-09-18 用户口径：原来是「蓝底 / 蓝边」胶囊按钮，改成圆型单选。
+    ★★2026-10-01 用户口径：「改成和设定卡里的一样」⇒ 圆点换成 `_PresetDot`（实心圆），
+    旧款「圆心留白」的 `_RadioDot` **已整块删除** —— 两处现在是**同一个类**，
+    选中态由**实心圆 + 外圈**表达，文字两侧不再有底色。改 `_PresetDot` = 同时改两处。
     """
 
     def __init__(self, title, hint, options, current, on_pick, parent=None):
@@ -4911,7 +5384,6 @@ class ApiFormDialog(_CardDialog):
 
     def __init__(self, title, fields, parent=None):
         super().__init__(parent)
-        self.setModal(True)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFixedWidth(360)
@@ -4985,17 +5457,19 @@ class MainWindow(QWidget):
 
     LEFT_WIDTH = 180
 
-    # ---- 右栏页面索引（0~2 为主界面，3 起为设置页，顺序与 SETTINGS_ITEMS 一致）----
+    # ---- 右栏页面索引（0~3 为主界面，4 起为设置页，顺序与 SETTINGS_ITEMS 一致）----
     PAGE_CHAT = 0
     PAGE_API = 1
     PAGE_WAKE = 2
-    SETTINGS_BASE = 3
+    PAGE_PRESET = 3          # 设定卡（2026-09-30）
+    SETTINGS_BASE = 4        # ★加了管理页就要跟着往后挪：设置页索引从它起算
 
-    # 管理项：(右栏页索引, 左栏显示名) —— 与 PAGE_API / PAGE_WAKE 一一对应。
-    # 加管理页只需在这里加一行 + 在 _build_right_panel 里补一个面板。
+    # 管理项：(右栏页索引, 左栏显示名) —— 与 PAGE_API / PAGE_WAKE / PAGE_PRESET 一一对应。
+    # 加管理页只需在这里加一行 + 在 _build_right_panel 里补一个面板（面板顺序必须与这里一致）。
     MANAGE_ITEMS = (
         (PAGE_API, "管理 API"),
         (PAGE_WAKE, "管理唤醒词"),
+        (PAGE_PRESET, "设定卡"),   # ★排在最后（用户口径）
     )
 
     # 设置项：(key, 左栏显示名)。新增设置页只需在这里加一行 ——
@@ -5250,7 +5724,7 @@ class MainWindow(QWidget):
                 self._show_settings_page(self.SETTINGS_BASE)
 
     def _is_manage_page(self, index):
-        return index in (self.PAGE_API, self.PAGE_WAKE)
+        return index in (self.PAGE_API, self.PAGE_WAKE, self.PAGE_PRESET)
 
     def _is_settings_page(self, index):
         return index >= self.SETTINGS_BASE
@@ -5281,9 +5755,11 @@ class MainWindow(QWidget):
         self._switch_right_panel(index)
 
     def _show_manage_page(self, index):
-        """切到管理区某个页面（index 为右栏页索引：管理 API / 管理唤醒词）。"""
+        """切到管理区某个页面（index 为右栏页索引：管理 API / 管理唤醒词 / 设定卡）。"""
         if index == self.PAGE_WAKE:
             self._show_wake_panel()
+        elif index == self.PAGE_PRESET:
+            self._show_preset_panel()
         else:
             self._show_api_panel()
 
@@ -5746,6 +6222,10 @@ class MainWindow(QWidget):
         self._wake_panel = WakeWordPanel(self.cfg, self._current_role_key, self)
         self._right_stack.addWidget(self._wake_panel)
 
+        # 设定卡面板（管理区第 3 页：跟随当前角色，与唤醒词页同一套做法）
+        self._preset_panel = PresetPanel(self.cfg, self._current_role_key, self)
+        self._right_stack.addWidget(self._preset_panel)
+
         # 设置类页面（顺序必须与 SETTINGS_ITEMS 一致，索引从 SETTINGS_BASE 起）
         builders = {
             "general": lambda: GeneralPanel(self.cfg, self),
@@ -5857,6 +6337,11 @@ class MainWindow(QWidget):
     def _show_wake_panel(self):
         self._wake_panel.set_role(self._current_role_key)
         self._switch_right_panel(self.PAGE_WAKE)
+
+    def _show_preset_panel(self):
+        """切到设定卡页 —— 每次进入都按**当前角色**重新渲染（预设是跟随角色的）。"""
+        self._preset_panel.set_role(self._current_role_key)
+        self._switch_right_panel(self.PAGE_PRESET)
 
     def _show_chat_panel(self):
         self._switch_right_panel(self.PAGE_CHAT)

@@ -6,7 +6,9 @@
   - `_split_ja_for_sovits`：短文本原样、长文本按句拆行、每行 ≤ 上限、切分无损、无标点长串硬切；
   - `synthesize()` 集成：用假 urlopen 断言「长日语被切成多行后一次请求下发」，
     且每行都不超过单行上限（即不会再触发服务端 54s 静默截断）；
-  - `role_ref()` **三级回落**（安装根 → 包内 `refs/` → 历史固定位置）+ 优先级负对照（2026-09-29）。
+  - `role_ref()` **三级回落**（安装根 → 包内 `refs/` → 历史固定位置）+ 优先级负对照（2026-09-29）；
+  - 口癖「邦邦卡邦」的**写法归一**（`normalize_bang`）与**预录音频替换**是否真的生效（2026-09-30 晚，第四批）；
+  - 合成结果「**明显偏短**」检测（`_wav_too_short`）—— 防 GPT-SoVITS 偶发「只念出开头一部分」（同批）。
 
 跑法（在项目根目录）：
     .venv\\Scripts\\python.exe tests\\smoke_tts.py
@@ -19,6 +21,8 @@ import wave
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 try:  # 控制台重定向时保证中文输出可读
@@ -50,6 +54,27 @@ check("拉丁字母被删除",
       tts._preprocess_ja_text("abcこんにちはxyz"))
 check("专名 B站 → ビリビリ",
       tts._preprocess_ja_text("B站") == "ビリビリ", tts._preprocess_ja_text("B站"))
+# ★2026-09-30 新增：角色名 / 称呼的兜底（用户报「中文的『爱丽丝』并没有正常合成语音」）。
+#   模型偶尔把名字写成简体中文塞进**日语段**（devlog/2026-09-16 记过「愛丽丝がそばに…」），
+#   GPT-SoVITS 日语前端读不了简体 ⇒ 合成失败 / 怪音。这里钉住「必须换成日文写法」。
+check("角色名 爱丽丝 → アリス",
+      tts._preprocess_ja_text("爱丽丝") == "アリス", tts._preprocess_ja_text("爱丽丝"))
+check("★只换半边的混排（devlog 里那个真例）整体变 アリス",
+      tts._preprocess_ja_text("愛丽丝がそばにいますよ") == "アリスがそばにいますよ",
+      tts._preprocess_ja_text("愛丽丝がそばにいますよ"))
+check("角色名 艾莲 → エレン",
+      tts._preprocess_ja_text("艾莲") == "エレン", tts._preprocess_ja_text("艾莲"))
+check("称呼 老师 → 先生",
+      tts._preprocess_ja_text("老师") == "先生", tts._preprocess_ja_text("老师"))
+check("★正经日文汉字不被误伤（只替换表里的词，不删中日共有汉字）",
+      tts._preprocess_ja_text("先生。愛。天気") == "先生。愛。天気",
+      tts._preprocess_ja_text("先生。愛。天気"))
+check("★长名先于碎片替换（否则「爱丽丝」只剩半截）",
+      tts._preprocess_ja_text("爱丽丝和丽丝") == "アリス和リス",
+      tts._preprocess_ja_text("爱丽丝和丽丝"))
+check("★口癖（中文写法）在预处理里被归一成假名",
+      tts._preprocess_ja_text("邦邦カバン！任務です。") == "ばんばかばん！任務です。",
+      tts._preprocess_ja_text("邦邦カバン！任務です。"))
 
 
 # ========== 2. 长文本按句切分 ==========
@@ -99,11 +124,9 @@ def _tone_wav(sr=32000, sec=0.5, freq=440.0):
         f.setnchannels(1)
         f.setsampwidth(2)
         f.setframerate(sr)
-        frames = bytearray()
-        for i in range(n):
-            v = int(0.6 * 32767 * math.sin(2 * math.pi * freq * i / sr))
-            frames += int(v).to_bytes(2, "little", signed=True)
-        f.writeframes(bytes(frames))
+        t = np.arange(n, dtype=np.float32) / sr
+        samples = (0.6 * 32767 * np.sin(2 * np.pi * freq * t)).astype(np.int16)
+        f.writeframes(samples.tobytes())
     return buf.getvalue()
 
 
@@ -134,14 +157,17 @@ def _fake_urlopen(req, timeout=None):
 
 _orig_alive = tts._service_alive
 _orig_urlopen = tts.urllib.request.urlopen
+_orig_sleep = tts.time.sleep
 tts._service_alive = lambda: True          # 视为服务在线，避免真的拉起/等待
 tts.urllib.request.urlopen = _fake_urlopen
+tts.time.sleep = lambda _s: None           # ★省掉重试之间的 1s 等待（被测逻辑一字不改）
 try:
     out = Path(__file__).resolve().parent / "_tts_smoke_out.wav"
     ok = tts.synthesize("alice", LONG, out)
 finally:
     tts._service_alive = _orig_alive
     tts.urllib.request.urlopen = _orig_urlopen
+    tts.time.sleep = _orig_sleep
 
 check("synthesize 返回成功", ok is True, str(ok))
 q = parse_qs(urlparse(captured.get("url", "")).query)
@@ -236,6 +262,119 @@ try:
 finally:
     tts.install_dir, tts.BASE_DIR, tts.LEGACY_REFS_DIR = _o_install, _o_base, _o_legacy
     shutil.rmtree(_ref_tmp, ignore_errors=True)
+
+
+# ========== 5. 口癖「邦邦卡邦」的**写法归一** + 预录音频替换 ==========
+# 背景（devlog/2026-09-30 §33/§34）：人设里的模板是**简体中文**「邦邦卡邦」，
+# 模型在**日语段**里并不照抄括号里的假名，实测会写「邦邦カバン」「邦邦カボン」
+# 「バンバカバン」等 —— ① 与 BANG 串不匹配 ⇒ 预录音频替换整条失效；
+# ② 「邦邦」是简体中文，GPT-SoVITS 日语前端读不了 ⇒ 合成时长剧烈波动。
+print("== 5. 口癖写法归一 + 预录音频替换 ==")
+
+_BANG_FORMS = ["ばんばかばん", "ばんばんかばん", "バンバカバン", "バンバンカバン",
+               "バンバカボン", "邦邦カバン", "邦邦カボン", "邦邦卡邦", "邦邦カ邦"]
+for _f in _BANG_FORMS:
+    check(f"归一 {_f} → ばんばかばん",
+          tts.normalize_bang(_f + "！任務です。") == "ばんばかばん！任務です。",
+          tts.normalize_bang(_f + "！任務です。"))
+check("★归一幂等", tts.normalize_bang(tts.normalize_bang("邦邦カバン！"))
+      == tts.normalize_bang("邦邦カバン！"))
+check("★不误伤普通日语", tts.normalize_bang("これは普通の文です。") == "これは普通の文です。")
+check("★不误伤「ばんばんと鳴った。」（无后接かばん）",
+      tts.normalize_bang("ばんばんと鳴った。") == "ばんばんと鳴った。")
+check("★不误伤「かばんを買った。」", tts.normalize_bang("かばんを買った。") == "かばんを買った。")
+
+# 替换生效的**直接证据**：下发文本里**不该再有口癖**（那一段由预录音频承担）
+_bang_calls = []
+
+
+def _bang_urlopen(req, timeout=None):
+    _q = parse_qs(urlparse(req.full_url).query)
+    _bang_calls.append(_q.get("text", [""])[0])
+    return _Resp(_WAV)
+
+
+_o_alive5 = tts._service_alive
+_o_urlopen5 = tts.urllib.request.urlopen
+tts._service_alive = lambda: True
+tts.urllib.request.urlopen = _bang_urlopen
+try:
+    for _f in ("ばんばかばん", "バンバカバン", "邦邦カバン", "邦邦卡邦"):
+        _bang_calls.clear()
+        _bout = tts.synthesize_with_bang("alice", f"{_f}！新しい任務を獲得しました。",
+                                         text_language="ja")
+        _sent = " ".join(_bang_calls)
+        check(f"★替换生效：{_f} 写法被切掉、不进合成",
+              bool(_bang_calls) and all(("邦邦" not in s and "ばんば" not in s
+                                         and "バンバ" not in s) for s in _bang_calls),
+              repr(_sent))
+        if _bout:
+            try:
+                Path(_bout).unlink()
+            except OSError:
+                pass
+finally:
+    tts._service_alive = _o_alive5
+    tts.urllib.request.urlopen = _o_urlopen5
+
+
+# ========== 6. 合成结果「明显偏短」检测（防「只念出开头一部分」）==========
+# 背景：GPT-SoVITS 偶尔「只合成一小段就收尾」，而那段音频**不是静音**
+# ⟹ `_wav_is_silent` 抓不到 ⟹ 用户听到「输出内容转化成的语音不完整」。
+print("== 6. 合成结果「明显偏短」检测 ==")
+
+
+def _tone(sec):
+    return _tone_wav(sr=32000, sec=sec)
+
+
+_T30 = "あ" * 30                      # 预期 0.167*30 = 5.01s；下限 55% = 2.76s
+check("_wav_seconds 与真实时长一致",
+      abs(tts._wav_seconds(_tone(2.0)) - 2.0) < 0.05, str(tts._wav_seconds(_tone(2.0))))
+check("坏数据 → _wav_seconds = 0.0", tts._wav_seconds(b"not a wav") == 0.0)
+check("坏数据不判偏短（读不出时保守放行）", tts._wav_too_short(b"not a wav", _T30) is False)
+check("★明显偏短 → True（1.7s，实测那个离群值）",
+      tts._wav_too_short(_tone(1.7), _T30) is True, str(tts._wav_seconds(_tone(1.7))))
+check("正常长度 → False（5.0s）", tts._wav_too_short(_tone(5.0), _T30) is False)
+check("略短但未越线 → False（3.5s）", tts._wav_too_short(_tone(3.5), _T30) is False)
+check("刚好越线 → True（2.5s < 2.76s）", tts._wav_too_short(_tone(2.5), _T30) is True)
+check("★短句不参与判定（< 8 字：即便音频短到 0.12s 也不判，免得误伤）",
+      tts._wav_too_short(_tone(0.12), "はい。") is False,
+      str(tts._wav_too_short(_tone(0.12), "はい。")))
+check("★拆行文本的换行不计入字数",
+      tts._wav_too_short(_tone(5.0), "\n".join(["あ" * 10] * 3)) is False)
+
+# 「偏短」时的**退路**：重试用尽 → 交出最长的一份（而不是变成「完全没声音」）
+_short_calls = []
+
+
+def _short_urlopen(req, timeout=None):
+    _short_calls.append(1)
+    return _Resp(_tone(1.0))          # 每次都只给 1.0s（远短于 30 字应有的 ≈5s）
+
+
+_o_alive6 = tts._service_alive
+_o_urlopen6 = tts.urllib.request.urlopen
+_o_sleep6 = tts.time.sleep
+tts._service_alive = lambda: True
+tts.urllib.request.urlopen = _short_urlopen
+tts.time.sleep = lambda _s: None
+try:
+    _sout = Path(__file__).resolve().parent / "_tts_short_out.wav"
+    _sok = tts.synthesize("alice", _T30, _sout)
+finally:
+    tts._service_alive = _o_alive6
+    tts.urllib.request.urlopen = _o_urlopen6
+    tts.time.sleep = _o_sleep6
+check("★一直偏短 ⇒ 真的重试了 3 次（不是直接放过）", len(_short_calls) == 3, str(len(_short_calls)))
+check("★一直偏短 ⇒ 仍返回 True（交出最长的一份，**绝不变成「没声音」**）", _sok is True, str(_sok))
+check("★偏短时写出的仍是有内容的音频",
+      _sout.exists() and _sout.stat().st_size > 44,
+      str(_sout.stat().st_size if _sout.exists() else "missing"))
+try:
+    _sout.unlink()
+except OSError:
+    pass
 
 
 print()

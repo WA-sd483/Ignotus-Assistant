@@ -75,6 +75,10 @@ _stub("app.asr", MicListener=_FakeMic, Recognizer=lambda *a, **k: object())
 # 语音合成替身：`synthesize_with_bang` 返回空串 = 没有音频（静音模式走的就是这条）
 _stub(
     "app.tts",
+    # ★替身必须与 `app/tts.py` 的**公开名**对齐（理由见 boot_probe.py 同一处注释）：
+    #   少了 `DEFAULT_TEXT_LANGUAGE`，`main.py` 的 worker 线程会静默死于 ImportError。
+    DEFAULT_TEXT_LANGUAGE="ja",
+    TEXT_LANGUAGE_NAMES={"zh": "中文", "en": "英语", "ja": "日语"},
     start_in_background=lambda *a, **k: None,
     set_volume=lambda *a, **k: None,
     set_muted=lambda *a, **k: None,

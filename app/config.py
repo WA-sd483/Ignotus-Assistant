@@ -1,4 +1,5 @@
 """配置加载与保存。"""
+import copy
 import json
 from pathlib import Path
 
@@ -72,14 +73,39 @@ DEFAULT_CONFIG = {
         "alice": {
             "name": "爱丽丝",
             "wake_words": ["爱丽丝"],
+            # ★`persona` = **当前使用的那套设定**，值就是**人设全文**（就是喂给模型的
+            #   system prompt），它同时是「设定卡」页里「哪张预设是选中的」的**唯一判据** ——
+            #   presets 里哪一项的 `persona` 等于它，哪一项就是当前预设。不另设
+            #   `current_preset` 指针：两个字段一旦漂移，页面上「显示的是这一份、实际用的是
+            #   那一份」会静默发生（本项目吃过的亏）。
+            # 2026-09-30 晚（设定卡可切换）：这个字段的**载体**从「人设文件路径」改成
+            #   「人设文本本身」—— 原因见 docs/02 §25.17。**这里仍写路径**：它是
+            #   `resolve_persona_text` 认得的「素材」，`load_config` 会就地解析成全文；
+            #   ★用户切换过一次后 `save_config` 落盘的就是全文，此后**不再碰这些 md**
+            #   （即：md 从"真值"退化成"一次性素材"，改它们不再生效）。
             "persona": "persona/alice.md",
             "pet_dir": "pet/alice",
+            # 「设定卡」（管理 → 设定卡）的「预设」区块（2026-09-30 新增）。
+            # 元素 = {"name": 预设命名（显示在卡片上）, "persona": 该预设的人设**全文**}。
+            # ★列表顺序 = 卡片从上到下的顺序；**选中的那张不会因为新增而挪位置**。
+            # ★内置项这里写**素材路径**，加载时被 `resolve_persona_text` 解析成全文；
+            #   一旦用户切换过、配置落盘，之后以 `config.json` 里那份为准（用户自己的改动优先）。
+            # 爱丽丝两张 —— 第一张是 wiki 版（默认**当前生效**：上面的 `persona` 与它解析后
+            #   相等 ⇒ 卡片自动显示为选中），第二张是从游戏内聊天记录统计出来的另一套。
+            #   ★两张都点得动：**点卡片（或圆点）即切过去**（用户 2026-09-30 口径）。
+            "presets": [
+                {"name": "天童爱丽丝（wiki）", "persona": "persona/alice.md"},
+                {"name": "天童爱丽丝（局内聊天记录统计）", "persona": "persona/alice_chatlog.md"},
+            ],
         },
         "ellen": {
             "name": "艾莲",
             "wake_words": ["艾莲"],
             "persona": "persona/ellen.md",
             "pet_dir": "pet/ellen",
+            "presets": [
+                {"name": "艾莲（wiki）", "persona": "persona/ellen.md"},
+            ],
         },
     },
 }
@@ -99,6 +125,47 @@ def is_role_switchable(key) -> bool:
     return str(key) in SWITCHABLE_ROLES
 
 
+# `.md` 结尾才当成素材路径（见下面的 `resolve_persona_text`：这条只在**没有换行**时才轮到）
+_PERSONA_PATH_SUFFIX = ".md"
+
+
+def resolve_persona_text(value) -> str:
+    """把「人设字段的值」统一成**人设全文** —— ★人设取值的**唯一入口**（2026-09-30 晚）。
+
+    这个字段有两态（「设定卡」从"只可查看"变成"可切换"时引入）：
+      - **人设全文**：卡里自带的那份文本（`save_config` 落盘后就是它）；
+      - **素材路径**：`DEFAULT_CONFIG` 里写的单行路径（`persona/alice.md`），
+        以及**老 `config.json`** 里存的路径。
+
+    ★判据 = **有没有换行**：路径不可能含换行，而两份内置人设都是多行 markdown。
+      ★**别改成"看结尾是不是 `.md`"** —— 那会把「真正在用的全文」误判成路径；
+      下面确实还有一条 `.md` 分支，但它只在**没有换行**时才轮到（即真的像路径了）。
+      ★**逐字返回，一个字符都不动**：这份文本就是喂给模型的 system prompt，
+        顺手"清理一下 markdown"会静默改掉回复内容与时长（用户口径：输出不要有太大变化）。
+
+    两条口径与旧 `ai.load_persona` 完全一致、别改：
+      - 路径读不到 ⇒ **空串**（宁可不带设定，也不把 `persona/alice.md` 这个**路径字符串**
+        当成人设喂给模型 —— 那会让模型收到一句莫名其妙的指令）；
+      - 全文原样返回（含 `# 一级标题`：旧路径也是把整个文件原文喂进去的，去掉就变了）。
+
+    细则与取舍（为什么 md 会从"真值"退化成"素材"）见 docs/02 §25.17。
+    """
+    text = str(value if value is not None else "")
+    if not text.strip():
+        return ""
+    if "\n" in text:
+        return text                      # 已经是全文
+    if text.endswith(_PERSONA_PATH_SUFFIX):
+        p = BASE_DIR / text
+        try:
+            if p.is_file():
+                return p.read_text(encoding="utf-8")
+        except OSError:
+            pass
+        return ""                        # 路径存在但读不出来 / 文件不在了
+    return text                          # 真就是一小段单行自定义人设
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     out = dict(base)
     for key, value in (override or {}).items():
@@ -109,8 +176,57 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
+def _merge_presets(defaults, saved) -> list:
+    """把**内置预设**并回从 `config.json` 读到的那一份（2026-09-30，加第二张预设时踩到）。
+
+    ★**为什么必须做**：`_deep_merge` 对**列表是整段替换**，而 `save_config` 会把 `roles`
+      整段写进 `config.json` ⇒ 配置文件里那份「上次保存时的预设快照」会把默认配置里**新加的内置
+      预设盖掉**。现象是「代码里明明加了一张卡，页面上就是不出现」，而且**完全不报错**。
+    ★**骨架用默认顺序**：内置项在前（顺序跟着 `DEFAULT_CONFIG` 走），配置文件里有、默认里没有的
+      项（将来的用户自定义预设）按原顺序追加在后 —— 与「新预设排在下面」的既有口径一致。
+    ★**同名项以配置文件里的那份为准**：尊重用户改动的人设内容（`persona` 值此时可能已是**全文**，
+      见 `resolve_persona_text`）—— 这也正是「用户切换过之后，内置定义不再覆盖用户那份」的实现点。
+    ★**副作用**：用户**删不掉**内置预设 —— 但内置项是随 `persona/*.md` 一起来的素材，本就不该由
+      用户删；将来做「删除」功能时，要删的是用户自定义项。
+    ★**纯函数**：两个入参都**假定已被 `resolve_persona_text` 解析过**（本函数只按 `name` 做归并，
+      不碰值的内容、也不读文件）—— 保持这样测试才好写、也不会有隐藏的 I/O。
+    ★★**人设值一律原样搬运，绝对不许 `.strip()`**（2026-09-30 晚踩到）：值现在是**人设全文**，
+      而人设文件末尾那个换行是它的一部分 —— 这里 strip 一下，内置卡的文本就比
+      `roles[*].persona` **少一个字符**，`presets[*].persona == role["persona"]` 不再成立
+      ⇒ 页面上那张卡**显示成"未选中"**（而且不报错）；点它还会被判成"换了张卡"而白写一次盘。
+      `strip()` 只用来**判空**（`text.strip()`），搬运用的是原串。
+    """
+    out, used = [], set()
+    for item in defaults or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        raw = item.get("persona")
+        text = str(raw) if raw is not None else ""
+        if not name or not text.strip():          # ★只判空才 strip
+            continue
+        for cand in saved:
+            if cand["name"] == name:
+                out.append(cand)          # 配置里有同名 ⇒ 用配置里那份（尊重用户改动）
+                break
+        else:
+            out.append({"name": name, "persona": text})
+        used.add(name)
+    out.extend(item for item in saved if item["name"] not in used)
+    return out
+
+
 def load_config() -> dict:
-    cfg = _deep_merge(DEFAULT_CONFIG, {})
+    # ★★必须 **deepcopy**，不能只 `_deep_merge(DEFAULT_CONFIG, {})`。
+    #   `_deep_merge` 是**浅拷贝**：`out = dict(base)`，遇到 dict 递归、遇到 **list 直接沿用同一个
+    #   对象** ⇒ 没有配置文件时 `cfg["roles"] is DEFAULT_CONFIG["roles"]`，`cfg["roles"]["alice"]`
+    #   就是**默认配置里那个 dict 本身**。而下面的角色段归一化会**就地写** `_role["persona"]` /
+    #   `_role["presets"]` ⇒ **默认配置被加载过程改掉**。
+    #   以前那几行恰好是幂等的（写回等值），所以没暴出来；2026-09-30 晚把 `persona` 从"路径"
+    #   解析成"全文"之后就不幂等了 —— `DEFAULT_CONFIG` 会被第一次 `load_config()` 灌满人设全文，
+    #   之后测试里凡是拿默认配置当基准的断言都在跟一份"被污染过的"数据比。
+    #   ★这类 bug 不报错、只让后来的断言莫名其妙（本项目最怕的一种）。
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
         try:
             override = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -218,6 +334,55 @@ def load_config() -> dict:
     # 音色克隆模型的**安装位置**（2026-09-22）：落盘的偏好。空串 = 按探测顺序自动找
     # （见 app/voice_model.py：自定义目录 → 项目内 runtime/GPT-SoVITS → D:\GPT-SoVITS）。
     general["model_dir"] = str(general.get("model_dir") or "").strip()
+    # 角色段归一化（2026-09-30，「设定卡」页依赖它）：
+    # ① `persona` / `presets[*].persona` 一律**解析成人设全文**（见 `resolve_persona_text`）：
+    #    默认配置与老 `config.json` 里存的是**素材路径**，这里就地换成文件原文；
+    #    已经落盘成全文的（用户切换过一次之后）原样留着、**不再碰 md**。
+    #    ★★两边**必须走同一个函数**：页面上「哪张预设选中」靠
+    #      `presets[*].persona == role["persona"]` 两串**逐字相等**，一个路径一个全文
+    #      ⇒ 一张都不选中（页面看着像"没选"，而且不报错）。
+    #    ★拿到非字符串会静默「一张都不选中」，所以入口处一律 `str()` 兜一下。
+    # ② `presets` 逐项清洗（必须有非空 name + 解析后非空的人设），**脏项直接丢**；
+    # ③ 清洗完为空 ⇒ 兜底造一张卡，指向**当前人设**，否则「设定卡」页会一片空白 ——
+    #    而空白页说不清「当前到底在用哪套设定」，比一张名字不好看的卡更难排查。
+    # ★方向与权限白名单一致：宁可显示一张兜底卡，也不能让页面显示不出「正在用的东西」。
+    roles = cfg.get("roles")
+    if not isinstance(roles, dict):
+        roles = {}
+        cfg["roles"] = roles
+    for _role_key, _role in roles.items():
+        if not isinstance(_role, dict):
+            continue
+        _role["persona"] = resolve_persona_text(_role.get("persona"))
+        _raw = _role.get("presets")
+        _clean = []
+        if isinstance(_raw, list):
+            for _item in _raw:
+                if not isinstance(_item, dict):
+                    continue
+                _name = str(_item.get("name", "")).strip()
+                _text = resolve_persona_text(_item.get("persona"))
+                if _name and _text:
+                    _clean.append({"name": _name, "persona": _text})
+        # ④ 把**内置预设**并回来（见 `_merge_presets` 的 docstring：配置文件里那份旧快照
+        #    会把默认配置新加的内置预设整段盖掉，且不报错）。内置项也要先解析成全文，
+        #    否则并回来的会是一条路径 —— 与 `role["persona"]` 比不相等 ⇒ 卡片显示"没选中"。
+        _drole = DEFAULT_CONFIG.get("roles")
+        _drole = _drole.get(_role_key) if isinstance(_drole, dict) else None
+        _builtin = _drole.get("presets") if isinstance(_drole, dict) else None
+        _builtin_clean = []
+        for _bitem in _builtin or []:
+            if not isinstance(_bitem, dict):
+                continue
+            _bname = str(_bitem.get("name", "")).strip()
+            _btext = resolve_persona_text(_bitem.get("persona"))
+            if _bname and _btext:
+                _builtin_clean.append({"name": _bname, "persona": _btext})
+        _clean = _merge_presets(_builtin_clean, _clean)
+        if not _clean and _role["persona"]:
+            _fallback_name = str(_role.get("name") or _role_key).strip()
+            _clean = [{"name": f"{_fallback_name}（默认）", "persona": _role["persona"]}]
+        _role["presets"] = _clean
     return cfg
 
 

@@ -22,6 +22,15 @@ _volume = 0.5
 # 全局静音开关：静音时播放增益为 0（音量值本身不变，便于点击喇叭图标恢复原音量）。
 _muted = False
 
+# ★「回复语言」的唯一真值（2026-09-30，管理 → 设定卡 页要显示它）。
+#   含义：**聊天界面显示的语言恒为中文；这一项指的是合成语音说的语言**（用户口径）。
+#   当前固定日语 —— 整条双语管线都建在它上面（`ai.py` 要求「日语在前 + `|||` 分界」、
+#   流式分句按日语切、`tts` 按日语预处理），所以页面上它是**只读**的；
+#   将来真做「改成中 / 英」时要动的是上面那一整套，届时这里就是唯一要改的取值入口。
+DEFAULT_TEXT_LANGUAGE = "ja"
+# 语言码 → 中文显示名（设定卡页与将来的设置项共用同一份，避免两处各写一张表）
+TEXT_LANGUAGE_NAMES = {"zh": "中文", "en": "英语", "ja": "日语"}
+
 
 def set_volume(v: float):
     """设置全局音量（0.0~1.0）。非法值回退到 0.5。"""
@@ -213,8 +222,25 @@ def start_in_background():
     threading.Thread(target=worker, daemon=True).start()
 
 
-# 常见中英混排专有名词 → 日文（GPT-SoVITS 日语模式无法处理中文/英文，会导致合成失败）
+# 常见中英混排专有名词 → 日文（GPT-SoVITS 日语模式无法处理中文/英文，会导致合成失败）。
+#
+# ★★2026-09-30：**新增「角色名 / 称呼」一类**（用户报「中文的『爱丽丝』并没有正常合成语音」）。
+#   模型偶尔会在**日语段**里把名字写成简体中文 —— 人设的「专有名词用日文写法」只举了
+#   **网站名**的例子，没给角色名 / 称呼的例子（`persona/alice*.md` 的「回复语言」一节）。
+#   最早记录于 devlog/2026-09-16：「愛**丽丝**がそばにいますよ」。GPT-SoVITS 的日语前端
+#   读不了简体的「丽 / 丝 / 师」，表现是**合成失败（静音）或怪音**。
+#   ⇒ 合成前统一换成日文写法（devlog 当时给的建议就是"合成前做一次替换"）。
+# ★★**顺序要紧**：`replace` 按**插入顺序**执行，长的全名必须写在短的碎片前面
+#   —— 否则「丽丝」先被替换掉，「爱丽丝」就永远匹配不上，只剩半截（「ア」+「リス」）。
+# ★**不做**「删掉所有中日共有的汉字」：那会把「先生 / 愛 / 天気」这些正经日文汉字一起删掉。
+#   没进表的简体字仍会漏 —— 遇到新的漏网字，往这里加一条即可（判据：日语里不这么写）。
 _CN_EN_TO_JA = {
+    # --- 角色名 / 称呼（模型偶尔写简体中文时的兜底；长的在前面）---
+    "爱丽丝": "アリス", "愛丽丝": "アリス", "愛麗絲": "アリス", "爱麗丝": "アリス",
+    "丽丝": "リス",                       # 兜底：只剩碎片时（如被拆开的「愛丽丝」）
+    "艾莲": "エレン", "艾蓮": "エレン",
+    "老师": "先生", "老師": "先生",
+    # --- 网站 / 应用 ---
     "哔哩哔哩": "ビリビリ", "bilibili": "ビリビリ", "Bilibili": "ビリビリ",
     "B站": "ビリビリ", "b站": "ビリビリ",
     "pixiv": "ピクシブ", "Pixiv": "ピクシブ", "P站": "ピクシブ", "p站": "ピクシブ",
@@ -227,12 +253,50 @@ _CN_EN_TO_JA = {
 }
 
 
+# ========== 口癖「邦邦卡邦」的写法归一（★2026-09-30 晚，第四批）==========
+#
+# ★★为什么需要：人设里给的模板是**简体中文**「邦邦卡邦」（`persona/alice*.md` 只把
+#   规范读音「ばんばかばん」放在括号里），所以模型在**日语段**里并不照抄假名，
+#   实测会写成（都抓到了实证）：
+#       「邦邦カボン！」「邦邦カバン！」「バンバカバン！」「邦邦卡邦！」
+#   （见 devlog/2026-09-30 §33 / §34 的实测输出）
+#   这两种写法各有后果、都很糟：
+#     ① 与 `synthesize_with_bang` 里的 BANG 串（`ばんばかばん`）**匹配不上**
+#        ⇒ **不替换成预录音频** ⇒ 用户报的「邦邦卡邦语音没有用指定的音频替换」；
+#     ② 「**邦邦**」是简体中文，GPT-SoVITS 日语前端读不了（同「爱丽丝」那种坑）
+#        ⇒ 同一句话的合成时长**剧烈波动**：实测「…！新しい任務を獲得しました…」
+#        一句在不同写法下分别是 1.70s / 5.70s / 6.74s / 9.34s
+#        （正解应 ≈ 7s）⇒ 表现成「输出内容转化成的语音不完整 / 念成怪音」。
+#   ⇒ 合上前统一归一成规范假名：替换认得它、TTS 也念得对。
+#
+# ★口径：**只归一「邦邦 × かばん/卡邦」这一族**（口癖是专有名词，且有「句首」用法约束），
+#   不写「删掉所有简体中文」那种大扫除 —— 那会把正经内容也一并改掉。
+#   模式放宽到「ばんば/バンバ/邦邦 + かばん族」，是为了吃下模型可能写出的**新变体**；
+#   单独出现「ばんばん」（无后接かばん）不会被匹配。
+_BANG_CANON = "ばんばかばん"
+_BANG_PAT = re.compile(
+    r"(?:ばんばん?|バンバン?|邦邦)"                    # 起手：ばんば(ん) / バンバ(ん) / 邦邦
+    r"(?:かばん|カバン|カボン|かボン|カ邦|卡邦|卡バン)"   # 后接「卡邦」的各种写法
+)
+
+
+def normalize_bang(text: str) -> str:
+    """把口癖「邦邦卡邦」的各种写法统一成规范假名 `ばんばかばん`（幂等、纯函数）。
+
+    两处调用缺一不可：`_preprocess_ja_text`（给 TTS 一个能念的文本）与
+    `synthesize_with_bang`（让「预录音频替换」认得出来）。
+    """
+    return _BANG_PAT.sub(_BANG_CANON, text or "")
+
+
 def _preprocess_ja_text(text: str) -> str:
     """预处理日语文本：
+    - 口癖「邦邦卡邦」的**各种写法**先归一成假名（★2026-09-30 晚；见 `normalize_bang`）；
     - 顿号"、"和空格会导致 GPT-SoVITS 合成静音，替换成句号；
     - 中英混排专有名词（B站/pixiv 等）换成日文，避免合成失败；
     - 删除残留的拉丁字母（GPT-SoVITS 日语模式无法处理英文）。
     """
+    text = normalize_bang(text)
     text = text.replace("、", "。")
     text = text.replace("\n", "。")  # 换行归一为句末，便于后续按句切分
     text = re.sub(r"[ \t]+", "。", text)
@@ -299,11 +363,50 @@ def _wav_is_silent(data: bytes, threshold: float = 0.005) -> bool:
         return True
 
 
-def synthesize(role_key: str, text: str, out_path, retries: int = 3, text_language: str = "ja") -> bool:
+# 「合成结果明显偏短」的判据（★2026-09-30 晚，第四批）。
+# 参照：devlog/2026-09-15 实测日语 `r ≈ 0.167 s/字`。阈值取 55% —— 宽到不吃正常语速/停顿的
+# 天然起伏（实测稳定时极差 ≈ ±10%），窄到能抓住实测那个离群值（1.70s vs 应有 ≈ 5.5s）。
+_EXPECT_SEC_PER_CHAR = 0.167
+_TOO_SHORT_RATIO = 0.55
+_TOO_SHORT_MIN_CHARS = 8      # 太短的句子本身不足 1.5s，估算噪声大 ⇒ 不判
+
+
+def _wav_seconds(data: bytes) -> float:
+    """wav 字节数据的时长（秒）；读不出来返回 0.0。"""
+    try:
+        import io
+        with wave.open(io.BytesIO(data)) as f:
+            sr = f.getframerate()
+            return (f.getnframes() / sr) if sr else 0.0
+    except Exception:
+        return 0.0
+
+
+def _wav_too_short(data: bytes, text: str, ratio: float = _TOO_SHORT_RATIO) -> bool:
+    """合成结果是否**明显短于**按字数估的时长（= 只念出了开头一部分）。
+
+    ★为什么需要：GPT-SoVITS 偶尔会「只合成一小段就收尾」，而那段音频**并不是静音**
+      （`_wav_is_silent` 抓不到）⇒ 以前被当成成功直接播出去，用户听到的就是
+      「输出内容转化成的语音不完整」。实测：同一句 24 字日语两次下发分别得
+      1.70s / 5.02s（后者才对）；见 devlog/2026-09-30 §34。
+    ★只判「长到值得判」的句子（≥ `_TOO_SHORT_MIN_CHARS` 字），避免短句误伤。
+    """
+    n = len((text or "").replace("\n", "").strip())
+    if n < _TOO_SHORT_MIN_CHARS:
+        return False
+    sec = _wav_seconds(data)
+    if sec <= 0:
+        return False          # 读不出时长 ⇒ 不判（保守放行，交给静音判据兜）
+    return sec < _EXPECT_SEC_PER_CHAR * n * ratio
+
+
+def synthesize(role_key: str, text: str, out_path, retries: int = 3, text_language: str = DEFAULT_TEXT_LANGUAGE) -> bool:
     """调用 GPT-SoVITS 合成 text，保存 wav 到 out_path。返回是否成功。
 
     首次启动服务需加载模型（约 1-2 分钟），合成前会等待服务就绪（最多 180s）。
-    合成结果会检测静音（GPT-SoVITS 偶发静音），静音则重试。
+    合成结果会做**两项**体检，不过关就重试（都重试失败则交出最长的一份，保证有声音）：
+      - 静音（GPT-SoVITS 偶发静音）；
+      - **明显偏短**（偶发「只念出开头一部分」，见 `_wav_too_short`）。
     """
     ref = role_ref(role_key)
     if not ref or not ref["ref_wav"]:
@@ -333,19 +436,31 @@ def synthesize(role_key: str, text: str, out_path, retries: int = 3, text_langua
         "speed": 1.0,
     }
     url = SOVITS_URL + "/?" + urllib.parse.urlencode(params)
+    best = None            # 重试期间**最长**的一份：都偏短时至少还给得出声音
+    best_sec = 0.0
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=300) as resp:
                 data = resp.read()
-            # 有效 wav 且非静音才算成功
+            # 有效 wav 且非静音才算候选
             if len(data) > 44 and not _wav_is_silent(data):
-                Path(out_path).write_bytes(data)
-                return True
+                sec = _wav_seconds(data)
+                if best is None or sec > best_sec:
+                    best, best_sec = data, sec
+                # ★三项都要过：非静音、而且**长度对得上**（防「只念出开头一部分」）
+                if not _wav_too_short(data, text):
+                    Path(out_path).write_bytes(data)
+                    return True
         except Exception:
             pass
         if attempt < retries - 1:
             time.sleep(1)
+    # 重试用尽：偏短的一份也比没有强 —— 交出最长的，保持「有声音」这一既有语义
+    # （★别在这里改成 return False：那会让「偶发偏短」直接变成「完全没声音」，更糟）
+    if best is not None:
+        Path(out_path).write_bytes(best)
+        return True
     return False
 
 
@@ -436,7 +551,7 @@ def play_wav(path, on_started=None) -> float:
     return duration
 
 
-def synthesize_to_file(role_key: str, text: str, text_language: str = "ja", target_rms=None):
+def synthesize_to_file(role_key: str, text: str, text_language: str = DEFAULT_TEXT_LANGUAGE, target_rms=None):
     """合成到临时文件，返回路径；失败返回 None。调用方负责删除文件。
 
     target_rms 非空时，把合成音频响度（RMS）对齐到该值，用于与预录制音频（邦邦卡邦）响度统一。
@@ -529,12 +644,17 @@ def _write_wav_mono(path, samples: np.ndarray, sr: int):
         f.writeframes(audio16.tobytes())
 
 
-def synthesize_with_bang(role_key: str, text: str, text_language: str = "ja"):
-    """合成日语语音；若含"ばんばかばん"（邦邦卡邦），该部分用 voices/邦邦卡邦/ 下随机预录制音频替换。
+def synthesize_with_bang(role_key: str, text: str, text_language: str = DEFAULT_TEXT_LANGUAGE):
+    """合成日语语音；若含口癖「邦邦卡邦」，该部分用 voices/{role}/邦邦卡邦/ 下随机预录制音频替换。
+
+    ★口癖的**各种写法**（`ばんばかばん` / `バンバカバン` / `邦邦カバン` / `邦邦卡邦` …）会先
+      归一成规范假名再判（`normalize_bang`）—— 模型实测并不照抄人设括号里的假名，
+      不归一就永远匹配不上 ⇒ 预录音频替换整条失效（见 `normalize_bang` 的注释）。
 
     返回临时文件路径或 None（调用方负责删除）。
     """
-    BANG = "ばんばかばん"
+    BANG = _BANG_CANON
+    text = normalize_bang(text)
     # 响度对齐基准：合成音频对齐到邦邦卡邦预录制音频的 RMS（无则 None，不归一化）
     target_rms = _bang_loudness_rms(role_key)
     if BANG not in text:

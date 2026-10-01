@@ -132,6 +132,87 @@ def shoot_api_dialogs():
         settle(120)
 
 
+def shoot_preset():
+    """设定卡（管理区第三页）+ 「查看」弹窗（2026-09-30 新增；同日第二批加到两张预设）。
+
+    核对点：
+    - 左栏管理导航**三项**、末项「设定卡」选中（浅蓝底整列 + 蓝底白字）；
+    - 右栏标题「设定卡」、分组「预设」、**两张卡**（wiki 版 / 局内聊天记录统计版）：
+      卡片 = **实心圆单选（只有当前生效的那份是选中态）+ 预设命名 + 右端蓝底白字「查看」**；
+      ★**整张卡点得动 = 切换**（2026-09-30 晚）；细则 `docs/02` §25.10 / §25.17。
+    - ★**hover 终态另出一张 `manage-preset-hover.png`**（2026-09-30 晚·第五批）：**挑一张未选中的卡**
+      置成 hover —— 底色 200ms 白 → 淡蓝 `#E6F1FB`、描边保持 `#CBD5E1`，与「管理 API」/「管理唤醒词」
+      的卡片同一条（用户口径「参照管理 api 和管理唤醒词里的卡片效果」）。
+      出这张的目的：**证明淡蓝底上那颗实心圆单选（灰圈 / 蓝实心圆）依然看得清** ——
+      这正是早先「只染描边、不敢填底色」的顾虑，现在用图钉死。默认态仍在 `manage-preset.png`。
+      ★**别写死第几张**：本机 config 里「当前选中的是哪张」会随用户点击漂移 ⇒ 用
+      `next(c for c in cards if not c._dot.isChecked())` 现挑（全选中时退化成最后一张）。
+    - 弹窗：窗口 = 卡片 = **540×460**（2026-09-30 定稿；那圈 12px 透明边随「点弹窗外关闭」一起删了）、
+      五项各有一个 `presetFieldBox` 文本框、右侧给滚动条留通道、底部一颗「关闭」。
+      ★**唯一的关法就是那颗「关闭」**（用户拍板）—— 弹窗上不再有应用级过滤器 / `paintEvent` /
+      `mousePressEvent` 那三层，`OUTER` 常量也删了（细则 `docs/02` §25.6）。
+    ★两张预设**各出一张**弹窗图（`-dialog` / `-dialog-chatlog`）—— 它们是两份不同的人设文件，
+      只出一张会让「第二张指向同一个文件」这种错看不出来。
+    `win.grab()` 抓不到 `PresetViewDialog`（独立顶层窗），必须单独 `grab()`。
+    """
+    win._select_nav(1)
+    win._show_manage_page(win.PAGE_PRESET)
+    settle()
+    path = OUT_DIR / "manage-preset.png"
+    win.grab().save(str(path))
+    panel = win._preset_panel
+    cards = panel._body.findChildren(gui._PresetCard)
+    print(f"saved {path.name:22s} page={win._right_stack.currentIndex()} "
+          f"nav={[(b.text(), b.isChecked()) for _i, b in win._manage_nav_btns]} "
+          f"preset={panel.current_name()!r} "
+          f"cards={[(c._name_text, c._dot.isChecked()) for c in cards]} "
+          f"left_bg={win.grab().toImage().pixelColor(20, 400).name()}")
+
+    # ★2026-09-30 晚（第五批）：预设卡 hover 终态 —— 与「管理 API」/「管理唤醒词」的卡片同一条
+    #   （底色 200ms 白 → 淡蓝；描边不动）。静态页面图抓不到 hover ⇒ 单独把**一张未选中的卡**
+    #   置成 hover 抓一张，一眼就能对照「淡蓝底上圆点的灰圈 / 描边都还看得清」。
+    #   ★优先挑**未选中**那张（本机 config 的当前预设可能是任意一张，写死下标会随环境漂移）；
+    #    全都选中（只有一张卡）时退化成最后一张。
+    if cards:
+        target = next((c for c in cards if not c._dot.isChecked()), cards[-1])
+        force_hover(target)
+        settle(200)
+        path_h = OUT_DIR / "manage-preset-hover.png"
+        win.grab().save(str(path_h))
+        print(f"saved {path_h.name:28s} hovered={target._name_text!r} "
+              f"checked={target._dot.isChecked()} hover={target._hover} "
+              f"is_white={'rgb(255,255,255)' in target.styleSheet()} "
+              f"is_hover_blue={'rgb(230,241,255)' in target.styleSheet()} "
+              f"border_static={'border:1px solid #CBD5E1' in target.styleSheet()}")
+
+    # 「查看」弹窗：每张预设各抓一张（按面板同一条口径装好五行，再单独抓弹窗自己）
+    presets = [p for p in panel._presets() if isinstance(p, dict)]
+    if not presets:
+        print("  ⚠️ 当前角色没有预设 —— 跳过弹窗截图")
+        return
+    for idx, item in enumerate(presets):
+        # ★2026-09-30 晚：人设载体改成「全文」后，取值走 `resolve_persona_text`、
+        #   解析走 `persona_sections_from_text(text)`（**不再**拼 BASE 路径读文件）—— 见 docs/02 §25.17。
+        #   与 `PresetPanel._on_view` 同一条口径（两处必须一致，否则截图与真弹窗会漂移）。
+        fields = gui.persona_sections_from_text(gui.resolve_persona_text(item.get("persona")))
+        rows = [(title, fields.get(key) or gui.PRESET_EMPTY)
+                for key, title, _head in gui._PRESET_FIELDS]
+        rows.append(("回复语言", gui.preset_language_name()))
+        dlg = gui.PresetViewDialog(win, str(item.get("name") or ""), rows)
+        dlg.show()
+        settle(400)
+        name = ("manage-preset-dialog.png" if idx == 0
+                else "manage-preset-dialog-chatlog.png")
+        path = OUT_DIR / name
+        dlg.grab().save(str(path))
+        boxes = dlg.findChildren(gui.QFrame, "presetFieldBox")
+        print(f"saved {name:30s} window={dlg.width()}x{dlg.height()} "
+              f"card={dlg._card.width()}x{dlg._card.height()} "
+              f"fields={len(boxes)} box_h={[b.height() for b in boxes]}")
+        dlg.close()
+        settle(120)
+
+
 def shoot_danger_countdown():
     """危险操作倒计时弹窗（关机 / 重启…）：**屏幕正中央**的 200×150 卡片（窗口 200×165）。
 
@@ -1491,6 +1572,7 @@ def main():
     shoot_chat_reply()
     shoot_manage("manage-api", win.PAGE_API)
     shoot_manage("manage-wake", win.PAGE_WAKE)
+    shoot_preset()
     shoot_api_dialogs()
     shoot_danger_countdown()
     shoot("settings-general", win._settings_index["general"])

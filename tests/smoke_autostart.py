@@ -17,6 +17,10 @@ import tempfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# ★★单跑也默认走「无声后端」（开关在 `app/patpat.py` 顶部）。本套的第 3 节会起子进程真跑
+#   `main()`（`boot_probe.py`），子进程**继承这里的环境** ⇒ 一并静音。
+#   2026-09-30 机器被 GPT-SoVITS 抢满 CPU 时，本套与 `smoke_pet` 各自 300s 超时被强杀。
+os.environ.setdefault("IGNOTUS_NO_AUDIO", "1")
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 try:  # 控制台重定向时保证中文输出可读
@@ -105,18 +109,35 @@ print("== 3. 真实跑 main() 的启动形态 ==")
 tmp_dir = Path(tempfile.mkdtemp(prefix="ignotus_boot_smoke_"))
 PROBE = BASE / "tests" / "boot_probe.py"
 
+# ★子进程硬超时：**必须**有。探针会真跑一次 `main()`，而这里实测出现过 300s 挂住
+#   （2026-09-30：机器被 GPT-SoVITS 抢满 CPU 时）。没有它的话本套会被一路拖到
+#   `run_all` 的 300s 硬超时强杀 —— **看不出是哪一个探针挂的**，也没有诊断信息。
+#   3 × 75s 最坏 225s，仍在 `run_all` 的兜底之内。
+PROBE_TIMEOUT = 75
+
 
 def run_probe(silent: bool, stale: bool = False) -> dict:
     out = tmp_dir / f"boot_{int(silent)}_{int(stale)}.json"
+    tag = ("自启" if silent else "普通") + ("+过时" if stale else "")
     env = os.environ.copy()                 # 必须整份继承：缺 TEMP/SYSTEMROOT 会让子进程踩坑
     env.pop("PYTHONPATH", None)
     env["BOOT_PROBE_OUT"] = str(out)
     env["BOOT_PROBE_SILENT"] = "1" if silent else "0"
     env["BOOT_PROBE_STALE"] = "1" if stale else "0"
-    r = subprocess.run([sys.executable, str(PROBE)], cwd=str(BASE), env=env,
-                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    try:
+        r = subprocess.run([sys.executable, str(PROBE)], cwd=str(BASE), env=env,
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        # 清进程树：`sys.executable` 是 venv 垫片，它还会再起一个真 python 子进程
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(e.pid)], capture_output=True)
+        got = e.stdout or ""
+        if isinstance(got, bytes):
+            got = got.decode("utf-8", "replace")
+        return {"_error": f"[{tag}] 探针 {PROBE_TIMEOUT}s 未返回（**挂起**，已强杀进程树）"
+                          f"\n已收到的输出尾（看最后一行停在哪一步）：\n{got[-600:]}"}
     if not out.exists():
-        return {"_error": f"rc={r.returncode}\n{r.stderr[-800:]}"}
+        return {"_error": f"[{tag}] rc={r.returncode}\n{r.stderr[-800:]}"}
     return json.loads(out.read_text(encoding="utf-8"))
 
 

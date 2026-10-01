@@ -30,6 +30,7 @@
 本模块只放**常量 + 纯函数 + 音效播放器**（全都能离屏断言）；
 叠加窗与窗口侧的状态机在 `app/pet.py`（`_PatPatOverlay` / `PetWindow`）。
 """
+import os
 import random
 from pathlib import Path
 
@@ -39,6 +40,19 @@ try:  # QtMultimedia 缺失时**不炸 import**：宠物照常跑，只是抚摸
 
     _HAS_QTMM = True
 except Exception:  # noqa: BLE001
+    _HAS_QTMM = False
+
+# ★★可强制「无声后端」：`IGNOTUS_NO_AUDIO=1` ⇒ 上面那个 `_HAS_QTMM` 直接当假。
+#   2026-09-30 起 `tests/run_all.py` 对**所有**测试套件默认打开它。
+#   理由是一条实打实的**偶发挂死**：本机 QtMultimedia 的 FFmpeg 后端在「**刚 play 就 stop**」
+#   时会偶发卡住（`PatPatSound.stop()` → `QMediaPlayer.stop()`），机器一忙必现 ——
+#   它把整套 `smoke_pet` 挂在原地（源码 3052 行，之后约 2200 行**永远跑不到**），
+#   还会连带挂住 `smoke_autostart`（它要跑真 `main()` 的子进程），只能靠 300s 硬超时强杀
+#   ⇒ 等于**半套测试形同不存在**。
+#   ★关掉后端**不改变任何被测行为**：`play()` 在 `_ensure()` **之前**就写好了 `self._last`
+#     ⇒ `last_played` 系断言照旧全绿（实测）；`is_available()` 只被生产代码用、没进任何断言。
+#   ★想验真后端：`IGNOTUS_NO_AUDIO=0` 单跑一次 `smoke_pet.py`（手动，可接受偶发挂）。
+if os.environ.get("IGNOTUS_NO_AUDIO") == "1":
     _HAS_QTMM = False
 
 # ---- 素材位置 ----

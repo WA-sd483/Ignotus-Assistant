@@ -17,7 +17,15 @@ except Exception:  # noqa: BLE001
     pass
 
 # 子进程的标准输出 / 错误统一走 UTF-8（与上面的解码口径一致）
-CHILD_ENV = dict(os.environ, PYTHONIOENCODING="utf-8")
+# ★★`IGNOTUS_NO_AUDIO=1`：强制「无声后端」（开关在 `app/patpat.py` 顶部）。
+#   本机 QtMultimedia 的 FFmpeg 后端在「**刚 play 就 stop**」时会**偶发挂死**
+#   ⇒ `smoke_pet`（卡在 `_patpat_stop()`，卡点之后约 2200 行永远跑不到）与
+#     `smoke_autostart`（子进程跑真 `main()`）会挂到 300s 硬超时。
+#   ★关掉它**不改任何被测行为**（`play()` 在 `_ensure()` **之前**就写好 `last_played`），
+#     只是不初始化原生后端那一步（细则见 TECH-GOTCHAS「六」）。
+#   ★要跑**真**后端：`IGNOTUS_NO_AUDIO=0 .venv/Scripts/python.exe tests/run_all.py`。
+CHILD_ENV = dict(os.environ, PYTHONIOENCODING="utf-8",
+                 IGNOTUS_NO_AUDIO=os.environ.get("IGNOTUS_NO_AUDIO", "1"))
 
 ROOT = Path(__file__).resolve().parent.parent
 PY = str(ROOT / ".venv" / "Scripts" / "python.exe")
@@ -32,9 +40,17 @@ SUITES = ["smoke_settings", "smoke_permissions", "smoke_api", "smoke_tts",
 # 它还会再起一个真 python 子进程，只 kill 垫片会留下孤儿。
 SUITE_TIMEOUT = 300
 
+print(f"[env] IGNOTUS_NO_AUDIO={CHILD_ENV['IGNOTUS_NO_AUDIO']}"
+      + ("（无声后端；原生音频后端偶发挂死，见 TECH-GOTCHAS「六」）"
+         if CHILD_ENV["IGNOTUS_NO_AUDIO"] == "1" else "（★真音频后端，可能偶发挂起）"))
+
 tot = 0
 bad = []
-for name in SUITES:
+flaky = []
+
+
+def run_suite(name):
+    """跑一套件，返回 `(ok, 项数, out, err, 失败原因)`（成功时原因为空串）。"""
     p = subprocess.Popen([PY, str(ROOT / "tests" / f"{name}.py")],
                          cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, encoding="utf-8", errors="replace", env=CHILD_ENV)
@@ -51,29 +67,46 @@ for name in SUITES:
             out, err = p.communicate(timeout=15)
         except Exception:  # noqa: BLE001
             out, err = "", ""
-        print(f"FAIL {name:22s} (超时 {SUITE_TIMEOUT}s —— 已强杀进程树)")
-        print("⚠️ 该套件超时（疑似偶发挂起；见 smoke_pet 里「单跑绿、全量跑红」那条时序赛跑）。")
-        print("   已收掉的输出尾 2000 字：")
-        print((out or "")[-2000:])
-        print((err or "")[-2000:])
-        bad.append(name)
-        continue
-    tail = [ln for ln in (out or "").splitlines() if ln.startswith("共 ")]
-    line = tail[-1] if tail else "(无输出)"
-    n = 0
-    for part in line.replace("，", " ").split():
-        if part.isdigit():
-            n = int(part)
-            break
-    tot += n
+        return False, _count(out), out, err, f"超时 {SUITE_TIMEOUT}s（已强杀进程树）"
+    n = _count(out)
     ok = "ALL_OK" in (out or "")
-    print(f"{'OK  ' if ok else 'FAIL'} {name:22s} {line}")
-    if not ok:
-        bad.append(name)
-        print((out or "")[-2000:])
-        print((err or "")[-2000:])
+    return ok, n, out, err, "" if ok else "有失败断言"
+
+
+def _count(out) -> int:
+    """从输出里取「共 N 项」的 N（取不到 → 0）。"""
+    tail = [ln for ln in (out or "").splitlines() if ln.startswith("共 ")]
+    for part in (tail[-1] if tail else "").replace("，", " ").split():
+        if part.isdigit():
+            return int(part)
+    return 0
+
+
+for name in SUITES:
+    ok, n, out, err, why = run_suite(name)
+    if ok:
+        tot += n
+        print(f"OK  {name:22s} {n} 项")
+        continue
+    # ★★已知偶发（`_patpat_stop()` 的原生音频后端 / 高负载） ⇒ **按规矩自动重跑一次**。
+    #   项目口径本来就是「见到 300s 超时先重跑一次再下结论」—— 这里替人跑掉那一步，
+    #   但**绝不静默**：重跑才过的会单独列出来，让人知道本轮有过抖动。
+    print(f"RETRY {name:21s}（{why}）—— 按规矩重跑一次")
+    ok2, n2, out2, err2, why2 = run_suite(name)
+    if ok2:
+        flaky.append(name)
+        tot += n2
+        print(f"OK  {name:22s} {n2} 项【重跑才过：第一次 {why}】")
+        continue
+    bad.append(name)
+    print(f"FAIL {name:22s}（第一次 {why} / 重跑 {why2}）")
+    print((out2 or "")[-2000:])
+    print((err2 or "")[-2000:])
 
 print()
 print(f"合计 {tot} 项，失败套数 {len(bad)}")
+if flaky:
+    print(f"⚠️ 偶发（重跑才过，不计失败）：{', '.join(flaky)}"
+          f" —— 根因与处置见 TECH-GOTCHAS「六」")
 print("ALL_OK" if not bad else "FAILED: " + ", ".join(bad))
 sys.exit(1 if bad else 0)

@@ -225,8 +225,8 @@ cfg["permissions"] = {"allowed_dirs": [], "allowed_apps": [], "allowed_actions":
                       "blocked_keywords": [], "danger_delay": 30}
 win = g.MainWindow(cfg)
 win.show()  # offscreen 下也要 show，否则 isVisible 恒为假
-check("右栏面板数 = 主界面 3 + 设置页数",
-      win._right_stack.count() == 3 + len(win.SETTINGS_ITEMS), str(win._right_stack.count()))
+check("右栏面板数 = 主界面 4 + 设置页数",
+      win._right_stack.count() == 4 + len(win.SETTINGS_ITEMS), str(win._right_stack.count()))
 _perm_idx = win._settings_index["permissions"]
 check("权限面板类型正确", isinstance(win._right_stack.widget(_perm_idx), g.PermPanel))
 win._show_settings_page(_perm_idx)
@@ -457,6 +457,105 @@ check("main.py：固定回复走**同一条流水线**（speak + release_text_ga
 check("main.py：倒计时弹窗挂在与回复同刻的那一处（`sync_danger_card()` 由 `_enter_speaking_ui` 调）",
       "def sync_danger_card" in _src_m
       and "sync_danger_card()" in _src_m.split("def _enter_speaking_ui")[1][:1200], "见 _enter_speaking_ui")
+
+print("== 10e. 「打开类」动作提示 + 唤醒招呼（2026-09-30 用户口径）==")
+# 背景（用户报的两件事）：
+#   ① 让爱丽丝「打开某文件夹 / 网站」时，她回「不清楚…」**却照样执行** ⇒ 言行不一致；
+#   ② 初次唤醒的招呼**老是同一句**。下面①查纯函数行为（真调），②查接线（AST，不按行号）。
+from app import main as mainmod  # noqa: E402（模块级只有定义；import 不会起 QApplication）
+
+_h_path = mainmod._pending_action_hint({"type": "open_path", "label": "桌面"})
+check("open_path：把「马上会打开」告诉 AI（前缀 [将执行]，别再答『不清楚』）",
+      _h_path.startswith("[将执行]") and "桌面" in _h_path, _h_path)
+_h_app = mainmod._pending_action_hint({"type": "open_app", "label": "记事本"})
+check("open_app：提示带软件名", _h_app.startswith("[将执行]") and "记事本" in _h_app, _h_app)
+_h_url = mainmod._pending_action_hint({"type": "open_url", "label": "bilibili"})
+check("open_url：提示带收藏名", _h_url.startswith("[将执行]") and "bilibili" in _h_url, _h_url)
+_h_srch = mainmod._pending_action_hint({"type": "search", "keyword": "原神"})
+check("★search（本地 / 收藏夹都没有）：要 AI 说「没找到」+「帮老师在浏览器里搜索」",
+      "没有找到" in _h_srch and "浏览器" in _h_srch and "原神" in _h_srch, _h_srch)
+check("查不出/未覆盖的类型 ⇒ 空串（不打扰模型，也别给假提示）",
+      mainmod._pending_action_hint({"type": "list_dir"}) == ""
+      and mainmod._pending_action_hint(None) == "")
+
+_g0 = mainmod.wake_greeting_prompt("", 0)
+check("唤醒招呼：换个轮转号就换个角度（『别老同一句』就靠这个）",
+      _g0 != mainmod.wake_greeting_prompt("", 1) and _g0.startswith("（") and _g0.endswith("）"), _g0)
+check("唤醒招呼：把上次那句回带给模型 + 明确要求换说法（招呼不进历史，只能这样防重复）",
+      "上次那句" in mainmod.wake_greeting_prompt("上次那句", 0))
+check("唤醒招呼：角度池 ≥3 条，且按池长轮转回来",
+      len(mainmod._WAKE_GREET_ANGLES) >= 3
+      and mainmod.wake_greeting_prompt("", 0)
+      == mainmod.wake_greeting_prompt("", len(mainmod._WAKE_GREET_ANGLES)),
+      str(mainmod._WAKE_GREET_ANGLES))
+
+# ---- 结构校验：接线必须真的在（AST 按结构查，不按行号 / 字符串 —— 见 docs/02 的假绿口径）----
+_TREE_MAIN = _ast.parse(_src_m)
+_par = {}
+for _n in _ast.walk(_TREE_MAIN):
+    for _c in _ast.iter_child_nodes(_n):
+        _par[_c] = _n
+
+
+def _func_main(name):
+    for _n in _ast.walk(_TREE_MAIN):
+        if isinstance(_n, _ast.FunctionDef) and _n.name == name:
+            return _n
+    return None
+
+
+def _enclosing_stmt_list(node):
+    """往上找到「直接包含它的那个语句列表」= 它真正落在哪个分支体里。"""
+    cur = node
+    while cur in _par:
+        p = _par[cur]
+        for _f, val in _ast.iter_fields(p):
+            if isinstance(val, list) and cur in val and all(isinstance(x, _ast.stmt) for x in val):
+                return val
+        cur = p
+    return None
+
+
+_cmd = _func_main("on_command")
+_pend = [n for n in _ast.walk(_cmd)
+         if isinstance(n, _ast.Assign) and isinstance(n.targets[0], _ast.Subscript)
+         and getattr(n.targets[0].value, "id", "") == "pending_action"
+         and isinstance(n.value, _ast.Name) and n.value.id == "action"]
+check("on_command：确实有 `pending_action[\"action\"] = action`（打开类暂存那一支）",
+      len(_pend) == 1, f"命中 {len(_pend)} 处")
+_branch = _enclosing_stmt_list(_pend[0]) if _pend else None
+_hint_asg = [n for n in (_branch or [])
+             if isinstance(n, _ast.Assign) and getattr(n.targets[0], "id", "") == "action_result"
+             and isinstance(n.value, _ast.Call)
+             and getattr(n.value.func, "id", "") == "_pending_action_hint"]
+check("★就在那一支里把提示交给 AI（AST：`action_result = _pending_action_hint(action)`）",
+      len(_hint_asg) == 1, f"命中 {len(_hint_asg)} 处")
+
+_ot = _func_main("on_text")
+check("on_text：唤醒招呼改走 `wake_greeting_prompt(...)`（不再写死那一句）",
+      len([n for n in _ast.walk(_ot) if isinstance(n, _ast.Call)
+           and getattr(n.func, "id", "") == "wake_greeting_prompt"]) == 1)
+check("on_text：每唤醒一次轮转号 +1（相邻两次必换角度）",
+      len([n for n in _ast.walk(_ot) if isinstance(n, _ast.AugAssign)
+           and isinstance(n.target, _ast.Subscript)
+           and getattr(n.target.value, "id", "") == "greet_ui"
+           and isinstance(n.target.slice, _ast.Constant) and n.target.slice.value == "index"]) == 1)
+
+_rd = _func_main("on_reply_done")
+check("on_reply_done：把这次**实际说过**的招呼记进 `greet_ui[\"last\"]`（下次据此避重）",
+      len([n for n in _ast.walk(_rd) if isinstance(n, _ast.Assign)
+           and isinstance(n.targets[0], _ast.Subscript)
+           and getattr(n.targets[0].value, "id", "") == "greet_ui"
+           and isinstance(n.targets[0].slice, _ast.Constant)
+           and n.targets[0].slice.value == "last"]) == 1)
+
+_mn = _func_main("main")
+_ginit = [n for n in _ast.walk(_mn) if isinstance(n, _ast.Assign)
+          and getattr(n.targets[0], "id", "") == "greet_ui" and isinstance(n.value, _ast.Dict)]
+check("main()：初始化 greet_ui（pending / last / index 三键）",
+      len(_ginit) == 1
+      and sorted(k.value for k in _ginit[0].value.keys) == ["index", "last", "pending"],
+      str(_ginit))
 check("main.py：弹窗两个按钮已注册（set_danger_callbacks + 两条回调）",
       "win.set_danger_callbacks(on_danger_run_now, on_danger_cancel)" in _src_m
       and "def on_danger_run_now" in _src_m and "def on_danger_cancel" in _src_m)

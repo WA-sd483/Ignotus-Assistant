@@ -4,7 +4,6 @@
 因此同一个程序可以接 DeepSeek、通义、Kimi、智谱、本地 Ollama 等任意 OpenAI 兼容服务。
 """
 import re
-from pathlib import Path
 
 from openai import OpenAI
 
@@ -17,13 +16,10 @@ MODEL = DEFAULT_MODEL
 MAX_TOKENS = 2048  # 必须同时覆盖「推理思考 token + 中文 + 日语」；320 太小，思考就吃光预算
 
 
-def load_persona(path: Path) -> str:
-    """读取人设文件内容作为 system prompt。文件不存在时返回空串。"""
-    p = Path(path)
-    if p.exists():
-        return p.read_text(encoding="utf-8")
-    return ""
-
+# ★原 `load_persona(path)` 已于 2026-09-30 晚**删除**：人设的载体从「文件路径」改成
+#   「文本本身」（「设定卡」可切换，见 `config.resolve_persona_text`），取值入口**只剩那一个**
+#   —— 本模块统一**收下已经组装好的 persona 字符串**（`_build_messages` 的第一个参数），
+#   不负责"人设从哪来"。★别再在这里加一个读文件的函数：两份读法必然漂移。
 
 # 双语标签与间隔符。persona 要求「日语在前、中文在后」，但解析必须两个顺序都能吃下
 # （模型偶尔会按旧习惯把中文写在前面；写死顺序会静默把中文送进日语语音模型）。
@@ -42,11 +38,31 @@ _RE_ZH_LABEL_PARTIAL = re.compile(rf"^\s*(?:中|{_LABEL_ZH})?\s*[:：]?\s*$")
 _RE_BOUNDARY_JA_FIRST = re.compile(rf"\|\|\||{_LABEL_ZH}\s*[:：]")
 _RE_BOUNDARY_ZH_FIRST = re.compile(rf"\|\|\||{_LABEL_JA}\s*[:：]", re.I)
 _KANA_RE = re.compile(r"[\u3040-\u30ff]")
+# ★★2026-09-30：语言判据从「假名」细化成「**平假名**」（`_has_hiragana`）。
+#   片假名**不能**当"这是日语"的证据 —— 中文回复里会正经出现片假名站名
+#   （ビリビリ / ピクシブ / ティックトック…，人设明确要求专有名词用日文写法）。
+#   拿 `_has_kana` 判的后果：**整句中文被误判成"只有日语一段"** ⇒ 界面拿不到中文
+#   （弹「缺少中文版本」＝用户报的「打开B站时无中文输出」），静音模式下更会把中文
+#   当日语送去合成。平假名**只出现在日语里**（中文不会有），所以判据换成它。
+#   代价：全是片假名、又没写「日语：」标签的一整段（如单喊「ビリビリ。」）会被当成
+#   中文 —— 罕见，且比"中文回复整个丢掉"轻得多。旧名 `_has_kana` 保留（测试在用）。
+_HIRAGANA_RE = re.compile(r"[\u3040-\u309f]")
 
 
 def _has_kana(text: str) -> bool:
     """含平假名 / 片假名 → 判定为日语（没有标签时用来兜底判定语言）。"""
     return bool(_KANA_RE.search(text or ""))
+
+
+def _has_hiragana(text: str) -> bool:
+    """含**平假名** → 判定为日语。★语言判据的统一入口（2026-09-30 起，见 `_HIRAGANA_RE`）。
+
+    为什么不用 `_has_kana`（含片假名）：中文回复里会出现片假名站名（ビリビリ 等），
+    用它判会把中文误判成日语 ⇒ 中文被丢掉（「缺少中文版本」）或送错合成语言。
+    平假名是日语独有的（中文没有），所以「有平假名 ⇒ 日语」这条**单向**判据是安全的；
+    反向（"没平假名 ⇒ 一定不是日语"）对纯片假名 / 纯汉字段不成立，取舍见 `_HIRAGANA_RE`。
+    """
+    return bool(_HIRAGANA_RE.search(text or ""))
 
 
 def _strip_label(text: str, which: str) -> str:
@@ -84,9 +100,9 @@ def _split_zh_ja_pair(left: str, right: str) -> tuple[str, str]:
         return _strip_label(left, "zh"), _strip_label(right, "ja")
     if _RE_JA_FIRST.match(left):
         return _strip_label(right, "zh"), _strip_label(left, "ja")
-    if _has_kana(right) and not _has_kana(left):
+    if _has_hiragana(right) and not _has_hiragana(left):
         return left, right
-    if _has_kana(left) and not _has_kana(right):
+    if _has_hiragana(left) and not _has_hiragana(right):
         return right, left
     return left, right  # 实在分不出来：按旧约定「中文在前」处理
 
@@ -116,7 +132,7 @@ def _parse_zh_ja(text: str) -> tuple[str, str]:
         return m.group(1).strip(), m.group(2).strip()
     # 解析失败。若通篇没有中文标签却满是假名，那其实是**只有日语一段**
     # （模型漏写了中文）—— 别把它当中文返回，否则界面会把日语显示出来。
-    if not _RE_ZH_LABEL.search(text) and _has_kana(text):
+    if not _RE_ZH_LABEL.search(text) and _has_hiragana(text):
         return "", _strip_label(text, "ja")
     # 否则整体当中文，日语置空（避免把中日混合文本送进语音模型）
     return _strip_label(text, "zh"), ""
@@ -163,7 +179,7 @@ def _stream_regions(raw: str, order: str = "ja_first") -> tuple[str, str, bool]:
     else:
         ja = _strip_prefix_label(head, "ja")
         zh = _strip_prefix_label(tail, "zh")
-        if not _has_kana(ja) and _has_kana(zh) and not _RE_JA_FIRST.match(head.lstrip()):
+        if not _has_hiragana(ja) and _has_hiragana(zh) and not _RE_JA_FIRST.match(head.lstrip()):
             # 没有任何标签时按假名兜底：日语那侧连一个假名都没有、另一侧有 → 其实反了
             ja, zh = zh, ja
     if not closed:
@@ -258,7 +274,9 @@ _ACTION_RESULT_HINT = (
     "请据此自然地告知用户（保持你的人设、口癖和语气）。"
     "注意：以「[已排程]」开头表示操作尚未执行、正在倒计时等待，"
     "要提醒用户可以说「取消」来中止；以「[权限拦截]」开头表示操作被安全设置"
-    "拒绝、没有执行，请如实说明原因，不要假装已经完成。"
+    "拒绝、没有执行，请如实说明原因，不要假装已经完成；"
+    "以「[将执行]」开头表示系统**马上就会执行**这个操作（与你这句回复同时进行），"
+    "请用你的语气确认你这就去做，**不要**说你做不到、也不要说你不清楚。"
 )
 
 # 静音模式（`zh_only=True`）：本轮只要中文。
@@ -453,7 +471,7 @@ def chat_stream(api, persona: str, history: list[dict], user_text: str,
         ja_ended = final or (order == "ja_first" and closed)
         # 别把中文当日语念：整段没有一个假名、段首也没有「日语：」标签 → 不认为是日语
         # （此时宁可不出声，由调用方改用中文兜底合成）。
-        if ja_ended and ja and (_has_kana(ja) or bool(_RE_JA_FIRST.match(raw.lstrip()))):
+        if ja_ended and ja and (_has_hiragana(ja) or bool(_RE_JA_FIRST.match(raw.lstrip()))):
             ja_sent = True
             emit("ja", ja)
 
