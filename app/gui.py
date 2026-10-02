@@ -2,6 +2,7 @@
 import html
 import os
 import random
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -10,7 +11,8 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
-    QCursor, QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QLinearGradient,
+    QCursor, QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon,
+    QLinearGradient,
     QPainter, QPainterPath, QPen, QPixmap, QRegion, QTransform,
 )
 from PySide6.QtWidgets import (
@@ -70,6 +72,12 @@ from .volume import VolumeSlider, VolumeStepButton
 from .state import State
 from . import voice_model
 from . import voice_download
+# ★P2（2026-10-02）：诊断内核与更新内核。两者都**不 import Qt**，
+#   判据全在那边（同一份结论给「引导 / 状态条 / 自检」三段 UI，见 app/health.py 抬头）。
+from . import health
+from . import update
+# ★版本号的**唯一真值**在 `app/__init__.py`（检查更新拿它跟 GitHub 的 tag 比）
+from . import __version__ as APP_VERSION
 
 BASE = Path(__file__).resolve().parent.parent
 ASSETS = BASE / "assets"
@@ -917,6 +925,445 @@ class PresetViewDialog(_CardDialog):
     def view(parent, name: str, rows):
         dlg = PresetViewDialog(parent, name, rows)
         dlg.exec()
+
+
+# ========== P2 体验三件套：首次引导 / 一键自检 / 检查更新（2026-10-02）==========
+#
+# ★三张卡片都继承 `_CardDialog`，走 design.md 4.5 那条共用皮肤
+#   （圆角 16px / 标题 15px Bold #0C447C / 正文 13px #334155 / 底部按钮右对齐 88×34）。
+# ★★**判据一个字都不在这里** —— 全在 `app/health.py`（三处 UI 用同一份结论，
+#   各写各的迟早漂移成「自检说没问题、状态条说没配 key」）。这里只负责**呈现**。
+# ★`level` 三档的配色**只用 design.md §1 已有的三个语义色**（不新增颜色）：
+#     ok   → 成功绿 #1E8E3E
+#     warn → 主蓝  #378ADD   （「你可能是故意的」，是信息不是错误）
+#     fail → 错误红 #C0392B
+_HL_COLORS = {"ok": "#1E8E3E", "warn": "#378ADD", "fail": "#C0392B"}
+
+
+def _status_dot(level: str) -> QLabel:
+    """状态小圆点（8px）。★颜色表在上面 —— 想加第四档之前先往 design.md 里加色。"""
+    dot = QLabel()
+    dot.setFixedSize(8, 8)
+    dot.setStyleSheet(
+        "background:%s; border-radius:4px;" % _HL_COLORS.get(level, "#64748B")
+    )
+    return dot
+
+
+class FirstRunDialog(_CardDialog):
+    """**首次使用引导**（P2）：还没配过 API 时自动弹一次；之后可随时从托盘 / 设置页重开。
+
+    用户视角的问题：装完第一次打开，软件「什么都没发生」—— 因为默认**没有 API Key、
+    白名单也是空的**（README 里那「第一次要自己做的两件事」）。本卡把那两件事摆在最前面，
+    并给一颗直通设置页的按钮。
+
+    - 宽度 360（design.md 4.5 的常规档）。
+    - 两项的 ✓/✗ 由 `health.guide_items()` **现算** ⇒ 重新打开时显示的是**当前**进度，
+      不是一张写死的说明图。
+    - 「去设置」= primary（`exec()` 回 Accepted）；「稍后再说」= 取消语义。
+    """
+
+    CARD_W = 360
+    BTN_W, BTN_H = 88, 34
+
+    def __init__(self, parent, items):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedWidth(self.CARD_W)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        card = QFrame()
+        card.setObjectName("confirmCard")          # ★沿用五款弹窗那张卡片
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(24, 24, 24, 20)
+        card_lay.setSpacing(14)
+
+        title = QLabel("欢迎使用 Ignotus Assistant")
+        title.setWordWrap(True)
+        title.setStyleSheet(
+            "font-size:15px; font-weight:bold; color:#0C447C; background:transparent;"
+        )
+        card_lay.addWidget(title)
+
+        intro = QLabel("她装好了，但还差两件事才能开口。按下面的提示各做一步就行：")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#334155; font-size:13px; background:transparent;")
+        card_lay.addWidget(intro)
+
+        for item in items:
+            card_lay.addWidget(self._build_item(item))
+
+        tip = QLabel("做完之后这一步会自动打勾。也可以在「设置」里随时再打开这份引导。")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#64748B; font-size:12px; background:transparent;")
+        card_lay.addWidget(tip)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        btn_row.addStretch(1)
+        later = QPushButton("稍后再说")
+        later.setObjectName("cancelBtn")
+        later.setCursor(Qt.PointingHandCursor)
+        later.setFixedSize(self.BTN_W, self.BTN_H)
+        later.clicked.connect(self.reject)
+        btn_row.addWidget(later)
+        go = QPushButton("去设置")
+        go.setObjectName("confirmBtn")
+        go.setCursor(Qt.PointingHandCursor)
+        go.setFixedSize(self.BTN_W, self.BTN_H)
+        go.clicked.connect(self.accept)
+        btn_row.addWidget(go)
+        card_lay.addLayout(btn_row)
+
+        outer.addWidget(card)
+        self.setStyleSheet(_CARD_FRAME_QSS + _CARD_BTN_QSS)
+
+    @staticmethod
+    def _build_item(item) -> QWidget:
+        """一项 = 「✓/✗ + 标题（加粗）+ 一句怎么办」。
+
+        ★这里的 ✓ 判据是 `item.ok`（= health 里的 `level == "ok"`），**不是**「有没有配置」
+          之类的第二套逻辑 —— 引导页和自检页必须同一口径。
+        """
+        done = (item.level == health.LEVEL_OK)
+        wrap = QWidget()
+        wrap.setStyleSheet("background:transparent;")
+        v = QVBoxLayout(wrap)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(8)
+        head.addWidget(_status_dot(item.level), 0, Qt.AlignVCenter)
+        name = QLabel(("%s　%s" % ("✓" if done else "•", item.title)))
+        name.setStyleSheet(
+            "font-size:13px; font-weight:bold; color:%s; background:transparent;"
+            % ("#1E8E3E" if done else "#0C447C")
+        )
+        head.addWidget(name, 1)
+        v.addLayout(head)
+
+        body_text = item.detail if done else (item.fix or item.detail)
+        body = QLabel("　　" + body_text)      # 缩进两格，与上面的圆点错开
+        body.setWordWrap(True)
+        pol = body.sizePolicy()
+        pol.setHorizontalPolicy(QSizePolicy.Ignored)   # ★别顶宽卡片（见 _SettingRow 的教训）
+        body.setSizePolicy(pol)
+        body.setStyleSheet("color:#64748B; font-size:12px; background:transparent;")
+        v.addWidget(body)
+        return wrap
+
+    @staticmethod
+    def show_guide(parent, items, on_go=None):
+        """弹一次引导。**非阻塞**（`open()`，不是 `exec()`）。
+
+        ★★为什么必须非阻塞：`main()` 在启动末尾会调它，而 `exec()` 会**嵌一个模态事件循环**
+          —— `main()` 从此回不去，`app.exec()` 也永远轮不到。那些「真跑一次 main() 再收尾」的
+          探针（`tests/boot_probe.py` 等，它们的 `exec` 是跑一小段就 return 的替身）会当场挂死。
+        ★`on_go`：点了「去设置」之后的回调（给 `MainWindow.show_first_run` 用）。
+        ★返回值是那个弹窗对象（**不阻塞**，所以拿不到「点了哪个按钮」的同步结果）——
+          非阻塞是这条路的硬约束，要结果就用 `on_go`。
+        """
+        dlg = FirstRunDialog(parent, items)
+        if on_go is not None:
+            dlg.finished.connect(lambda code: on_go() if code == QDialog.Accepted else None)
+        dlg.open()
+        return dlg
+
+
+class SelfCheckDialog(_CardDialog):
+    """**一键自检**（P2）：把 `health.check_all()` 的清单原样列出来。
+
+    每条 = 「圆点 + 标题（加粗）+ 当前状态一句话」，不通过的再补一行**怎么办**。
+    顶部那行汇总写「通过 N · 提示 N · 失败 N」，末尾给一颗「重新检查」（现算，不缓存）。
+
+    ★宽度 440（同 `ChoiceDialog`）：每条要放「标题 + 一句状态 + 一句修复指引」，
+      360 装不下、会频繁折行；高度给到 430，一屏能看全六条。
+    """
+
+    CARD_W, CARD_H = 440, 430
+    BTN_W, BTN_H = 88, 34
+
+    def __init__(self, parent, checks, on_recheck=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(self.CARD_W, self.CARD_H)
+        self._on_recheck = on_recheck
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        card = QFrame()
+        card.setObjectName("confirmCard")
+        card.setFixedSize(self.CARD_W, self.CARD_H)
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(24, 20, 24, 20)
+        card_lay.setSpacing(12)
+
+        title = QLabel("一键自检")
+        title.setStyleSheet(
+            "font-size:15px; font-weight:bold; color:#0C447C; background:transparent;"
+        )
+        card_lay.addWidget(title)
+
+        self._summary = QLabel("")
+        self._summary.setStyleSheet("color:#64748B; font-size:12px; background:transparent;")
+        card_lay.addWidget(self._summary)
+
+        # 滚动区复用设置页那一套（胶囊滚动条 + 垂直常驻位 + body 右留 8px 呼吸位）
+        _scroll, _body, self._body_lay = _panel_scroll(card_lay)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        btn_row.addStretch(1)
+        self._recheck_btn = QPushButton("重新检查")
+        self._recheck_btn.setObjectName("cancelBtn")
+        self._recheck_btn.setCursor(Qt.PointingHandCursor)
+        self._recheck_btn.setFixedSize(self.BTN_W, self.BTN_H)
+        self._recheck_btn.clicked.connect(self._recheck)
+        btn_row.addWidget(self._recheck_btn)
+        close_btn = QPushButton("关闭")
+        close_btn.setObjectName("confirmBtn")
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setFixedSize(self.BTN_W, self.BTN_H)
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(close_btn)
+        card_lay.addLayout(btn_row)
+
+        outer.addWidget(card)
+        self.setStyleSheet(_CARD_FRAME_QSS + _CARD_BTN_QSS + _PRESET_BOX_QSS)
+
+        self.set_checks(checks)
+
+    def set_checks(self, checks) -> None:
+        """灌一份清单（`on_recheck` 回来之后也走它 —— 重新检查不重建弹窗，只换内容）。"""
+        self._checks = list(checks)
+        _clear_body(self._body_lay)
+        for c in self._checks:
+            self._body_lay.addWidget(self._build_row(c))
+        self._body_lay.addStretch(1)
+        ok, warn, fail = health.summary(self._checks)
+        self._summary.setText("通过 %d · 提示 %d · 失败 %d" % (ok, warn, fail))
+        # 一条都不失败时，把汇总染成绿色（成功提示，design.md 的 #1E8E3E）
+        self._summary.setStyleSheet(
+            "color:%s; font-size:12px; background:transparent;"
+            % ("#1E8E3E" if not fail else "#64748B")
+        )
+
+    def _build_row(self, c) -> QWidget:
+        wrap = QFrame()
+        wrap.setObjectName("presetFieldBox")     # 借用「框住内容」那套皮（淡蓝底 + 淡蓝边）
+        v = QVBoxLayout(wrap)
+        v.setContentsMargins(12, 8, 12, 8)
+        v.setSpacing(4)
+
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(8)
+        head.addWidget(_status_dot(c.level), 0, Qt.AlignVCenter)
+        name = QLabel(c.title)
+        name.setStyleSheet(
+            "font-size:13px; font-weight:bold; color:%s; background:transparent;"
+            % _HL_COLORS.get(c.level, "#334155")
+        )
+        head.addWidget(name, 1)
+        v.addLayout(head)
+
+        detail = QLabel(c.detail)
+        detail.setWordWrap(True)
+        pol = detail.sizePolicy()
+        pol.setHorizontalPolicy(QSizePolicy.Ignored)   # ★别顶宽卡片
+        detail.setSizePolicy(pol)
+        detail.setStyleSheet("color:#334155; font-size:12px; background:transparent;")
+        v.addWidget(detail)
+
+        if c.fix:
+            fix = QLabel("怎么办：" + c.fix)
+            fix.setWordWrap(True)
+            pol = fix.sizePolicy()
+            pol.setHorizontalPolicy(QSizePolicy.Ignored)
+            fix.setSizePolicy(pol)
+            fix.setStyleSheet("color:#378ADD; font-size:12px; background:transparent;")
+            v.addWidget(fix)
+        return wrap
+
+    def _recheck(self):
+        """「重新检查」：向调用方**再要一份清单**（现算，不吃缓存）。"""
+        if self._on_recheck is None:
+            return
+        self.set_checks(self._on_recheck())
+
+    @staticmethod
+    def run_check(parent, checks, on_recheck=None):
+        dlg = SelfCheckDialog(parent, checks, on_recheck=on_recheck)
+        dlg.exec()
+
+
+class UpdateDialog(_CardDialog):
+    """**检查更新**（P2）：查 GitHub 最新 release，比 `app.__version__`。
+
+    ★★**联网在后台线程里跑，主线程只轮询结果**：一个 HTTP 请求最长要等到超时（6s），
+      直接在 UI 线程里调会把界面冻住 6 秒。线程把三态结果写进**普通 dict**、
+      QTimer 每 120ms 读一次 —— 与 `GeneralPanel` 轮询下载进度**同一套写法**，
+      **不发 Qt 信号**（本项目的铁律：跨线程只传 str/int）。
+
+    ★四态由 `update.check_latest` 给出，文案在这里成形：
+        update → 「发现新版本 vX」+「前往下载」
+        latest → 「已是最新版本（vX）」
+        none   → 「仓库还没有发布版本」（**不是错误**：新仓库的正常状态）
+        error  → 「检查失败：…」（不吓人，可重试）
+    """
+
+    CARD_W, CARD_H = 400, 230
+    BTN_W, BTN_H = 88, 34
+    POLL_MS = 120
+
+    def __init__(self, parent, current, checker=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(self.CARD_W, self.CARD_H)
+        # ★`checker` 可注入（测试喂一个不下网的假实现）；默认走 update.check_latest
+        self._checker = checker or (lambda: update.check_latest(current))
+        # 线程 → 主线程的唯一通道：一个只含 str 的 dict（轮询读，不发信号）
+        self._result = {"state": "", "detail": "", "url": ""}
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        card = QFrame()
+        card.setObjectName("confirmCard")
+        card.setFixedSize(self.CARD_W, self.CARD_H)
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(24, 20, 24, 20)
+        card_lay.setSpacing(12)
+
+        title = QLabel("检查更新")
+        title.setStyleSheet(
+            "font-size:15px; font-weight:bold; color:#0C447C; background:transparent;"
+        )
+        card_lay.addWidget(title)
+
+        self._ver = QLabel("当前版本：v%s" % current)
+        self._ver.setStyleSheet("color:#64748B; font-size:12px; background:transparent;")
+        card_lay.addWidget(self._ver)
+
+        self._msg = QLabel("正在检查…")
+        self._msg.setWordWrap(True)
+        pol = self._msg.sizePolicy()
+        pol.setHorizontalPolicy(QSizePolicy.Ignored)
+        self._msg.setSizePolicy(pol)
+        self._msg.setStyleSheet("color:#334155; font-size:13px; background:transparent;")
+        card_lay.addWidget(self._msg)
+
+        self._extra = QLabel("")
+        self._extra.setWordWrap(True)
+        pol = self._extra.sizePolicy()
+        pol.setHorizontalPolicy(QSizePolicy.Ignored)
+        self._extra.setSizePolicy(pol)
+        self._extra.setStyleSheet("color:#64748B; font-size:12px; background:transparent;")
+        card_lay.addWidget(self._extra)
+
+        card_lay.addStretch(1)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        btn_row.addStretch(1)
+        self._go = QPushButton("前往下载")
+        self._go.setObjectName("confirmBtn")
+        self._go.setCursor(Qt.PointingHandCursor)
+        self._go.setFixedSize(self.BTN_W + 16, self.BTN_H)
+        self._go.clicked.connect(self._open_page)
+        self._go.setVisible(False)
+        btn_row.addWidget(self._go)
+        self._retry = QPushButton("重试")
+        self._retry.setObjectName("cancelBtn")
+        self._retry.setCursor(Qt.PointingHandCursor)
+        self._retry.setFixedSize(self.BTN_W, self.BTN_H)
+        self._retry.clicked.connect(self._start)
+        self._retry.setVisible(False)
+        btn_row.addWidget(self._retry)
+        close_btn = QPushButton("关闭")
+        close_btn.setObjectName("cancelBtn")
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setFixedSize(self.BTN_W, self.BTN_H)
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(close_btn)
+        card_lay.addLayout(btn_row)
+
+        outer.addWidget(card)
+        self.setStyleSheet(_CARD_FRAME_QSS + _CARD_BTN_QSS)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.POLL_MS)
+        self._timer.timeout.connect(self._poll)
+
+    # ---- 开始 / 轮询 ----
+    def start(self):
+        """弹窗显示之后由调用方（或 `show_check`）调一次。"""
+        self._start()
+        return self.exec()
+
+    def _start(self):
+        """起一个后台线程跑检查（**已有线程在跑就不重复起**）。"""
+        if self._result.get("state"):
+            self._result = {"state": "", "detail": "", "url": ""}
+        self._msg.setText("正在检查…")
+        self._extra.setText("")
+        self._go.setVisible(False)
+        self._retry.setVisible(False)
+
+        def work():
+            try:
+                state, detail, url = self._checker()
+            except Exception as e:  # noqa: BLE001  线程里绝不许漏异常（会静默死）
+                state, detail, url = update.STATE_ERROR, "检查更新失败：%s" % e, update.RELEASES_PAGE
+            # ★只写字符串（跨线程铁律）；主线程在 `_poll` 里取
+            self._result["state"] = str(state)
+            self._result["detail"] = str(detail)
+            self._result["url"] = str(url)
+
+        threading.Thread(target=work, daemon=True).start()
+        self._timer.start()
+
+    def _poll(self):
+        state = self._result.get("state") or ""
+        if not state:
+            return
+        self._timer.stop()
+        detail = self._result.get("detail") or ""
+        if state == update.STATE_UPDATE:
+            self._msg.setText("发现新版本：%s" % detail)
+            self._msg.setStyleSheet("color:#1E8E3E; font-size:13px; background:transparent;")
+            self._extra.setText("可到 GitHub Releases 下载新的成品包（解压覆盖即可）。")
+            self._go.setVisible(True)
+        elif state == update.STATE_LATEST:
+            self._msg.setText("已是最新版本（%s）。" % detail)
+            self._msg.setStyleSheet("color:#1E8E3E; font-size:13px; background:transparent;")
+        elif state == update.STATE_NONE:
+            self._msg.setText(detail)
+            self._msg.setStyleSheet("color:#334155; font-size:13px; background:transparent;")
+            self._extra.setText("等作者发布第一个版本后，这里就能检查到更新了。")
+        else:
+            self._msg.setText(detail)
+            self._msg.setStyleSheet("color:#C0392B; font-size:13px; background:transparent;")
+            self._retry.setVisible(True)
+
+    def _open_page(self):
+        url = self._result.get("url") or update.RELEASES_PAGE
+        QDesktopServices.openUrl(QUrl(url))
+
+    def closeEvent(self, event):
+        self._timer.stop()          # 关窗就停表（线程是 daemon，自己会退出）
+        super().closeEvent(event)
+
+    @staticmethod
+    def show_check(parent, current, checker=None):
+        dlg = UpdateDialog(parent, current, checker=checker)
+        dlg.start()
+        return dlg
 
 
 class DangerCountdownDialog(QDialog):
@@ -4695,6 +5142,24 @@ class GeneralPanel(_MessagePanel, QWidget):
             on_click=self._reset_pet_pos,
         )
         self._body_lay.addWidget(self._reset_pos_row)
+
+        # 「帮助」分组（P2，2026-10-02）：三件都是**点一下就走**的一次性动作，所以都用
+        # `_SettingActionRow`（右侧一颗蓝色镂空按钮，无状态）。★三行各自弹的卡片都在
+        # gui.py 里（首引 / 自检 / 更新），判据在 app/health.py 与 app/update.py。
+        _group_header(self._body_lay, "帮助")
+        self._body_lay.addWidget(
+            _SettingActionRow("使用引导", hint="", button_text="打开引导",
+                              on_click=self._open_guide)
+        )
+        self._body_lay.addWidget(
+            _SettingActionRow("一键自检", hint="", button_text="开始自检",
+                              on_click=self._run_self_check)
+        )
+        self._body_lay.addWidget(
+            _SettingActionRow("检查更新", hint="", button_text="检查更新",
+                              on_click=self._check_update)
+        )
+
         # 行全部建好之后，再按**模型是否就位**刷新「下载行」与「静音滑块」的锁死状态。
         # 必须放在这里而不是各行新建时：锁死要动 `_mute_row`，它得先存在。
         self._apply_model_state()
@@ -4747,6 +5212,7 @@ class GeneralPanel(_MessagePanel, QWidget):
         # 不经过这里 —— 两条路各弹各的、不会重叠。
         if self._win is not None:
             self._win.notify_mute_mode(on)
+        self._refresh_health(False)     # P2：静音开关也影响「顶上那条常显状态条」
         self._msg("已开启静音模式：回复只输出中文，不再合成语音（已记住，重启后仍是开启）。"
                   if on else "已关闭静音模式：恢复日语语音。（已记住，重启后仍是关闭）")
 
@@ -4820,6 +5286,35 @@ class GeneralPanel(_MessagePanel, QWidget):
         ok = bool(win is not None and win.reset_pet_pos())
         self._msg("桌宠已回到默认位置（屏幕右下角）。" if ok
                   else "角色还没就位，稍后再试。", error=not ok)
+
+    # ---- 帮助（P2：使用引导 / 一键自检 / 检查更新，2026-10-02）----
+
+    def _refresh_health(self, recompute=False):
+        """设置页改了东西之后，顺手把顶上那条**常显状态条**重算一次（P2）。
+
+        ★必须做：状态条讲的与这一页改的是**同一件事**（静音 / 模型 / 白名单），
+          一个变了另一个还写着旧的，比不显示更误导。
+        ★`recompute=True` 只在**真的可能改变外部事实**的地方用（换安装位置 / 下载完成 /
+          卸载）—— 它会去 stat 模型目录；滑块回调那种场景只重跑 cfg 判据就够。
+        """
+        win = self._win
+        if win is not None and hasattr(win, "refresh_health"):
+            win.refresh_health(recompute_facts=recompute)
+
+    def _open_guide(self):
+        """「打开引导」：与首次启动弹的是**同一张卡**（判据现算 ⇒ 会显示当前进度）。"""
+        if self._win is not None:
+            self._win.show_first_run()
+
+    def _run_self_check(self):
+        """「开始自检」：弹自检清单（现算，不吃缓存）。"""
+        if self._win is not None:
+            self._win.self_check()
+
+    def _check_update(self):
+        """「检查更新」：弹更新卡（后台线程查 GitHub，主界面不冻）。"""
+        if self._win is not None:
+            self._win.check_update()
 
     # ---- 语音模型（音色克隆模型下载 / 安装位置，2026-09-22）----
 
@@ -4907,6 +5402,7 @@ class GeneralPanel(_MessagePanel, QWidget):
             return
         self._dl_timer.stop()
         self._apply_model_state()
+        self._refresh_health(True)      # P2：下载收尾（下完 / 取消 / 报错）⇒ 重探事实
         if snap.get("done"):
             self._msg("音色克隆模型下载完成 —— 静音模式已解锁，但仍保持「开」（要出声请自己关掉静音）。",
                       error=False)
@@ -4937,6 +5433,7 @@ class GeneralPanel(_MessagePanel, QWidget):
         self._general()["model_dir"] = path
         save_config(self.cfg)
         self._apply_model_state()
+        self._refresh_health(True)      # P2：安装位置变了 ⇒ 重探「模型就位没」
 
         if voice_model.is_model_dir_ok(Path(path) / voice_model.MODEL_SUBDIR):
             self._msg("安装位置已改为 %s（模型已就位）。" % path)
@@ -5036,6 +5533,7 @@ class GeneralPanel(_MessagePanel, QWidget):
             return
         done = voice_model.uninstall(self.cfg, chosen)
         self._apply_model_state()
+        self._refresh_health(True)      # P2：卸载完 ⇒ 重探「模型就位没」
         if not done:
             self._msg("卸载没有完成：还有文件没删掉（可能被别的程序占用），可稍后重试。", error=True)
             return
@@ -5503,6 +6001,14 @@ class MainWindow(QWidget):
         self._on_pet_lock = None          # 「通用设置 → 桌宠固定」切换后的通知（main.py 注入）
         self._on_volume = None            # 「通用设置 → 音量」改动后的通知（main.py 注入）
         self._page_change_cb = None        # 右栏换页后的通知（main.py 用它重判桌宠气泡）
+        # ★P2（2026-10-02）常显状态条：`_health_facts_fn` 由 main.py 注入（只有它知道
+        #   「麦克风 / 语音识别就绪没」）；未注入时退回 `health.collect_facts`（只探模型）。
+        #   ★`_health_facts` 是**缓存**：翻页时用 `refresh_health(recompute_facts=False)`
+        #     复用上一次的结果 —— 免得每次切页都去 stat 一遍几百 MB 的模型目录。
+        self._health_facts_fn = None
+        self._health_facts = {}
+        self._health_status = None
+        self._health_full_text = ""
         self._quitting = False          # 正在退出：closeEvent 一律放行（见 closeEvent 注释）
         self._left_mode = self.LEFT_MODE_ROLE   # 左栏形态：role / manage / settings
         self._settings_page = self.SETTINGS_BASE   # 上次停留的设置页（右栏页索引）
@@ -5539,6 +6045,7 @@ class MainWindow(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         root.addWidget(self._build_titlebar())
+        root.addWidget(self._build_health_strip())   # ★P2：常显状态条（标题栏正下方）
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
@@ -5546,6 +6053,173 @@ class MainWindow(QWidget):
         body.addWidget(self._build_divider(), 0)
         body.addWidget(self._build_right_panel(), 1)
         root.addLayout(body, 1)
+
+    # ---- P2：常显状态条（2026-10-02）----
+
+    HEALTH_H = 30       # 状态条高度
+
+    def _build_health_strip(self):
+        """标题栏正下方的**常显状态条**：一眼看出「她现在能不能用、不能的话卡在哪」。
+
+        - 高 **30px**；浅蓝底 `#F6FAFF` + 1px 下边框 `#E6F1FB`（= design.md §1 的输入框底色
+          与弹窗边框，不新增颜色）。
+        - 左：8px 状态圆点 + 12px 文案；右：一颗「去设置」小按钮（**只在有落点时才出现**）。
+        - ★★**文案与落点都不由这里决定** —— `health.status_line()` 说了算。它与「一键自检」
+          「首次引导」用的是**同一份判据**，所以那三处不可能互相打架（见 app/health.py 抬头）。
+        - ★它是**常驻**的：一切就绪时显示绿色「一切就绪」而不是把自己藏起来 ——
+          用户要能靠它确认「现在到底正不正常」，藏起来就只剩「出问题时才出现」这一个信号，
+          反而分不清「没问题」和「这软件没有这个功能」。
+        """
+        bar = QFrame()
+        bar.setObjectName("healthStrip")
+        bar.setFixedHeight(self.HEALTH_H)
+        bar.setStyleSheet(
+            "QFrame#healthStrip{background:#F6FAFF; border:none;"
+            " border-bottom:1px solid #E6F1FB;}"
+        )
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(20, 0, 20, 0)
+        h.setSpacing(8)
+
+        self._health_dot = _status_dot(health.LEVEL_OK)
+        h.addWidget(self._health_dot, 0, Qt.AlignVCenter)
+
+        self._health_label = QLabel("")
+        self._health_label.setStyleSheet(
+            "color:#64748B; font-size:12px; background:transparent;"
+        )
+        # ★横向 `Ignored` + 自己按宽度省略（同 `_SettingRow` 的教训：不换行的 QLabel 的
+        #   minimumSizeHint 等于整段文字宽度，会把状态条顶宽、把右边那颗按钮挤出去）
+        pol = self._health_label.sizePolicy()
+        pol.setHorizontalPolicy(QSizePolicy.Ignored)
+        self._health_label.setSizePolicy(pol)
+        h.addWidget(self._health_label, 1)
+
+        self._health_btn = QPushButton("去设置")
+        self._health_btn.setCursor(Qt.PointingHandCursor)
+        self._health_btn.setFixedSize(64, 22)
+        self._health_btn.setStyleSheet(
+            "QPushButton{background:transparent; color:#378ADD; border:1px solid #378ADD;"
+            " border-radius:8px; font-size:12px; padding:0;}"
+            "QPushButton:hover{background:#E6F1FB;}"
+        )
+        self._health_btn.clicked.connect(self._health_go)
+        self._health_btn.setVisible(False)
+        h.addWidget(self._health_btn, 0, Qt.AlignVCenter)
+
+        self._health_strip = bar
+        return bar
+
+    def set_health_facts_provider(self, fn):
+        """注入「外部事实」的取值回调（main.py 用；返回 `{"tts_installed": bool|None,
+        "asr_ok": bool|None}`）。不注入时退回 `health.collect_facts`（只探模型）。"""
+        self._health_facts_fn = fn
+
+    def _compute_health_facts(self) -> dict:
+        if self._health_facts_fn is not None:
+            try:
+                return dict(self._health_facts_fn() or {})
+            except Exception:  # noqa: BLE001  取事实失败不该把界面搞崩
+                return {}
+        return health.collect_facts(self.cfg)
+
+    def refresh_health(self, recompute_facts: bool = True):
+        """重算状态条（返回那条 `Status`）。
+
+        - `recompute_facts=True`（默认）：**重新探一遍**外部事实（会 stat 模型目录）——
+          启动、ASR 初始化完成、模型下载完成之后调它。
+        - `recompute_facts=False`：**复用缓存的事实**，只重跑那几条纯判据（读 cfg）——
+          翻页时调它，用来接住「用户刚在设置页填了 key / 加了目录 / 拨了静音」。
+
+        ★**故意不缓存结论**：每次现算。缓存了就会出现「改了设置、状态条还写着旧的」。
+        """
+        if recompute_facts:
+            self._health_facts = self._compute_health_facts()
+        facts = self._health_facts or {}
+        st = health.status_line(
+            self.cfg,
+            tts_installed=facts.get("tts_installed"),
+            asr_ok=facts.get("asr_ok"),
+        )
+        self._health_status = st
+        self._health_full_text = st.text
+        self._health_label.setText(st.text)
+        self._health_label.setStyleSheet(
+            "color:%s; font-size:12px; background:transparent;" % _HL_COLORS.get(st.level, "#64748B")
+        )
+        self._health_dot.setStyleSheet(
+            "background:%s; border-radius:4px;" % _HL_COLORS.get(st.level, "#64748B")
+        )
+        self._health_btn.setVisible(st.page is not None)
+        self._apply_health_elide()
+        return st
+
+    def _apply_health_elide(self):
+        """状态条文案按当前宽度做右侧省略（窄窗口下不许把「去设置」挤出去）。"""
+        lbl = getattr(self, "_health_label", None)
+        if lbl is None or not self._health_full_text:
+            return
+        avail = lbl.width()
+        if avail <= 0:
+            return
+        elided = lbl.fontMetrics().elidedText(self._health_full_text, Qt.ElideRight, avail)
+        if elided != lbl.text():
+            lbl.setText(elided)
+
+    def _health_go(self):
+        """状态条右边那颗「去设置」。"""
+        st = getattr(self, "_health_status", None)
+        if st is not None:
+            self.open_health_target(st.page)
+
+    def open_health_target(self, page):
+        """跳到某个问题所在的页（`page` 是 `health.PAGE_*` 字符串）。
+
+        ★走 `_show_manage_page` / `_show_settings_page` —— 与「点左栏导航」完全同一条路，
+          所以进入设置页该刷新的会刷新、折叠分组该复位的会复位，不另起一套。
+        """
+        if not page:
+            return
+        self.bring_to_front()
+        if page == health.PAGE_API:
+            self._show_manage_page(self.PAGE_API)
+        elif page == health.PAGE_PERMISSIONS:
+            self._show_settings_page(self._settings_index.get("permissions", self.SETTINGS_BASE))
+        else:
+            self._show_settings_page(self._settings_index.get("general", self.SETTINGS_BASE))
+
+    # ---- P2：一键自检 / 检查更新 / 首次引导 ----
+
+    def health_facts(self) -> dict:
+        """把「外部事实」取回来（自检清单与状态条**共用**这一份）。"""
+        return self._compute_health_facts()
+
+    def _build_checks(self):
+        """现算一份自检清单（`on_recheck` 与首次弹窗都走它 —— 不吃缓存）。"""
+        f = self.health_facts()
+        return health.check_all(self.cfg, tts_installed=f.get("tts_installed"),
+                                asr_ok=f.get("asr_ok"))
+
+    def self_check(self):
+        """跑一次「一键自检」并弹窗（设置页 / 托盘菜单都汇到这里）。"""
+        SelfCheckDialog.run_check(self, self._build_checks(), on_recheck=self._build_checks)
+
+    def check_update(self):
+        """「检查更新」：弹窗 + 后台线程查 GitHub 最新 release。"""
+        UpdateDialog.show_check(self, APP_VERSION)
+
+    def show_first_run(self):
+        """弹「首次使用引导」（启动时若还没配过 API 会自动调；也可从托盘 / 设置页手动打开）。
+
+        ★**非阻塞**（见 `FirstRunDialog.show_guide`）：启动路径里不许 `exec()` 一个模态窗，
+          否则 `main()` 回不去、探针全挂。
+        ★点「去设置」⇒ 直接送到「管理 API」页（那是首次必做的那一步）。
+        """
+        FirstRunDialog.show_guide(
+            self,
+            health.guide_items(self.cfg),
+            on_go=lambda: self.open_health_target(health.PAGE_API),
+        )
 
     def _build_divider(self):
         """左栏与右栏之间的分界：向右 3px 渐变阴影。"""
@@ -5688,7 +6362,11 @@ class MainWindow(QWidget):
         """页面**真的换了**之后通知一次。
 
         必须排在 `setCurrentIndex()` **之后** —— 回调里要读的是新页面（`is_chat_page()`）。
+        ★这里**顺带重算一次状态条**（`recompute_facts=False`，只读 cfg、不 stat 模型目录）：
+          用户在设置页填完 key / 加完目录、切回聊天页时，状态条要当场变绿 ——
+          否则它一直写着旧结论，比不显示还误导。
         """
+        self.refresh_health(recompute_facts=False)
         if self._page_change_cb is not None:
             self._page_change_cb()
 
@@ -6360,6 +7038,7 @@ class MainWindow(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._apply_rounded_corners()
+        self._apply_health_elide()      # 状态条按新宽度重新省略（P2）
 
     # ---- 对外接口（main.py 依赖）----
     def set_status(self, state: State):

@@ -15,8 +15,15 @@ from .gui import MainWindow
 from .pet import PetWindow
 from .state import State
 from . import stats
+from . import health          # ★P2（2026-10-02）：诊断内核（状态条 / 自检 共用同一份判据）
+from . import logging_setup
+from .logging_setup import get_logger
 # ai（openai）与 asr（sherpa_onnx）加载较慢，均改为延迟导入：
 # ai 在 _ask_ai 内导入，asr 在后台线程 init_asr 内导入。
+
+# 本模块的 logger。★**在 `logging_setup.setup()` 之前取是安全的**：
+# handler 是在 emit 那一刻沿 logger 层级往上找的，不是取 logger 时绑定的。
+LOG = get_logger("main")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ICON_PATH = BASE_DIR / "assets" / "icon" / "app_icon.png"
@@ -242,6 +249,12 @@ def pet_default_pos(pet) -> tuple:
 
 
 def main() -> int:
+    # ★第一件事（2026-10-01 第五批）：把日志与「未捕获异常」钩子装上。
+    #   放在 QApplication 之前 —— 之后任何一步崩了都留痕；幂等，重复调用是空操作。
+    #   ★★必须挂在 main() 里，不能只挂 run.py：exe 走的是 `make_stage.py` 生成的
+    #   `entry.py`，它**不经过 run.py** ⇒ 只挂 run.py 会让打包形态完全没有日志。
+    logging_setup.setup()
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setFont(QFont("Microsoft YaHei UI", 10))  # 统一字体，消除 QFont 点大小告警
@@ -279,7 +292,18 @@ def main() -> int:
         """
         return bool((cfg.get("general") or {}).get("mute_mode", False))
 
+    # ★P2：语音识别是在**后台线程**里初始化的（见下面的 init_asr），而状态条 / 自检
+    #   随时可能来问「起来了没」。用一个普通 dict 当跨线程信箱 —— 只存 True / False / None
+    #   （初始 None = 还不知道，状态条那时会说「正在初始化…」而不是诬赖它坏了）。
+    asr_state = {"ok": None}
+
     win = MainWindow(cfg)
+    # ★P2（2026-10-02）：把「外部事实」的取值回调交给主窗口。
+    #   **只有这里知道麦克风 / 语音识别到底起没起来**（它在后台线程里初始化，见下方 init_asr），
+    #   所以状态条与「一键自检」都得从这里拿 —— 别让它们各自去猜。
+    #   `asr_state` 是个普通 dict：跨线程只传 bool/None（本项目铁律）。
+    win.set_health_facts_provider(lambda: health.collect_facts(cfg, asr_ok=asr_state["ok"]))
+    win.refresh_health()
     pet = PetWindow(BASE_DIR / cfg["roles"][role_key]["pet_dir"])
 
     # 把主窗口带到最前面（托盘点击 / 桌宠右键菜单时调用）
@@ -295,6 +319,13 @@ def main() -> int:
     tray.setToolTip("Ignotus Assistant")
     tray_menu = QMenu()
     tray_menu.addAction("打开主界面", show_main_window)
+    # ★P2（2026-10-02）：托盘里也能拿到「使用引导 / 一键自检 / 检查更新」——
+    #   这三件正是「感觉它不太对劲」时最先想找的东西，只藏在设置页里没人想得到。
+    tray_menu.addSeparator()
+    tray_menu.addAction("使用引导", lambda: win.show_first_run())
+    tray_menu.addAction("一键自检", lambda: win.self_check())
+    tray_menu.addAction("检查更新", lambda: win.check_update())
+    tray_menu.addSeparator()
 
     # 彻底退出：停麦克风、放行关闭拦截、收起桌宠与托盘、重置当前角色、退出
     def quit_app():
@@ -1064,6 +1095,10 @@ def main() -> int:
                                     zh_only=zh_only)
                 failure = bool(reply.get("truncated"))
             except Exception:  # noqa: BLE001
+                # ★2026-10-01：这里以前是**光秃秃的 `failure = True`** —— 整个 API 异常
+                #   零痕迹地消失，用户看到的就是「AI 不回复」。现在留完整调用栈。
+                #   ★只加这一行，控制流（置 failure、走回退）一个字没改。
+                LOG.exception("流式回复失败（api=%s）⇒ 回退非流式", api_name)
                 failure = True
 
             if failure and not pipe.has_started:
@@ -1074,6 +1109,8 @@ def main() -> int:
                     reply = chat_once(api, persona, history, text,
                                       action_result=action_result, zh_only=zh_only)
                 except Exception:  # noqa: BLE001
+                    # ★同上的第二处：非流式回退也失败 ⇒ 这条回复变成空字符串。
+                    LOG.exception("非流式回退也失败（api=%s）⇒ 本条回复为空", api_name)
                     reply = {"zh": "", "ja": ""}
                 reply_bridge.reply_ready.emit(key, reply["zh"], reply["ja"], api_name)
                 return      # 余下交给非流式路径（on_ai_reply → on_tts_ready）
@@ -1331,6 +1368,13 @@ def main() -> int:
         win.hide()
     else:
         win.show()
+        # ★P2（2026-10-02）：首次使用引导 —— 只在这台机器上**一个 API 都还没配**时才弹。
+        #   ★★引导是**非阻塞**的（`FirstRunDialog.show_guide` 走 `open()` 而不是 `exec()`）：
+        #     `exec()` 会在这里嵌一个模态事件循环，`main()` 就再也回不去了 ——
+        #     那些「真跑一次 main()」的探针（boot_probe / reply_probe…）会直接挂到硬超时。
+        #   ★延后 600ms：先把主窗口画出来，别一开机就糊一张弹窗在屏幕上。
+        if health.first_run_needed(cfg):
+            QTimer.singleShot(600, win.show_first_run)
 
     pet.move(*pet_default_pos(pet))
 
@@ -1360,7 +1404,8 @@ def main() -> int:
         set_tts_volume(float(cfg.get("volume", 0.5)))
         start_tts()
     except Exception:
-        pass
+        # ★「没声音」的第一现场：以前这里是 `pass`，真因完全无从查起。
+        LOG.exception("后台拉起语音合成服务失败（不影响窗口显示）")
 
     # 语音识别初始化放到后台线程（加载模型约 1s+，不阻塞窗口显示）
     def init_asr():
@@ -1371,16 +1416,32 @@ def main() -> int:
             mic = MicListener(recognizer, on_text=bridge.text_ready.emit)
             mic.start()
             listener = mic
-            QTimer.singleShot(
-                0,
-                lambda: win.add_system_message("语音识别已就绪，喊「爱丽丝」或「艾莲」试试"),
-            )
+            asr_state["ok"] = True
+
+            def _report_asr_ok():
+                win.add_system_message("语音识别已就绪，喊「爱丽丝」或「艾莲」试试")
+                # ★P2：状态条「正在初始化…」→「一切就绪」（要重探事实才敢说"就绪"）。
+                #   ★这个回调跑在**主线程**（QTimer），碰 Qt 是安全的。
+                win.refresh_health()
+
+            QTimer.singleShot(0, _report_asr_ok)
         except Exception as e:  # noqa: BLE001
+            # ★界面那条灰字里只有 `str(e)`（常常就一句 `[Errno 2] ...`，指不出任何位置）；
+            #   完整的调用栈进日志。用户看的和你看的，从此是两份东西。
+            LOG.exception("语音识别初始化失败")
             listener = None
-            QTimer.singleShot(
-                0,
-                lambda: win.add_system_message(f"语音识别未就绪：{e}"),
-            )
+            asr_state["ok"] = False
+            # ★★必须在 except 块内先把原因取成局部变量：`except ... as e` 在**块结束时会 `del e`**
+            #   （连闭包里的 cell 一起清空）⇒ 这个内层函数是 QTimer 稍后在主线程才调的，
+            #   那一刻 `e` 已经没了，会抛 NameError —— 而 stderr 早已被兜到 devnull ⇒ 静默。
+            #   （2026-10-02 ruff 的 F821 抓出来的：这条灰字此前**从来没成功显示过**。）
+            reason = str(e)
+
+            def _report_asr_fail():
+                win.add_system_message(f"语音识别未就绪：{reason}")
+                win.refresh_health()      # ★P2：状态条当场说明「喊不醒」
+
+            QTimer.singleShot(0, _report_asr_fail)
 
     threading.Thread(target=init_asr, daemon=True).start()
 
@@ -1429,6 +1490,7 @@ def main() -> int:
     def _apply_model_gate():
         from . import voice_model
         if voice_model.is_installed(cfg):
+            win.refresh_health()          # ★P2：让状态条拿到「模型就位」这个事实
             return
         cfg.setdefault("general", {})["mute_mode"] = True
         win.sync_mute_mode(True)
@@ -1436,6 +1498,7 @@ def main() -> int:
             "没有找到音色克隆模型，已自动进入静音模式（回复只输出中文、不出声）。"
             "可在「设置 → 通用设置 → 语音模型」里查看状态。"
         )
+        win.refresh_health()              # ★P2：刚被判进静音 ⇒ 状态条要跟着说这一条
 
     _apply_model_gate()
 

@@ -17,6 +17,13 @@ for _name in ("stdout", "stderr"):
 # 注册表启动项无法指定工作目录，这里固定到项目根，保证相对路径一致
 os.chdir(BASE_DIR)
 
+# ★日志与「未捕获异常」钩子必须在 `import app.main` **之前**装好：
+#   否则 `from app.main import main` 本身失败（缺依赖 / 语法错）时没有任何痕迹。
+#   ★幂等 —— `main()` 里还会再调一次；那一次是给**打包形态**兜底的：
+#   exe 走的是 `make_stage.py` 生成的 `entry.py`，它不经过本文件。
+from app.logging_setup import setup as _setup_logging  # noqa: E402
+_setup_logging()
+
 from app.main import main  # noqa: E402  （需在 chdir 之后导入，保证路径基于项目根）
 
 if __name__ == "__main__":

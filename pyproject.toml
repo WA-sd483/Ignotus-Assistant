@@ -1,0 +1,30 @@
+# ★本文件**故意不含 `[project]` 表** —— 它只用来配 ruff 这类开发工具。
+#   没有 `[project]` ⇒ pip 不会把这个目录当成「可安装包」，
+#   对现有打包流程（IA_build 的白名单收集）与运行时行为**零影响**。
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+# 不扫这些目录：`IA_build` 是打包工作区（里面有一份 vendored setuptools，扫了全是噪音）；
+# 其余是虚拟环境 / 下载的运行时 / 模型 / 素材。
+exclude = ["IA_build", ".venv", "runtime", "models", "pet", "voices", "assets", "docs"]
+
+[tool.ruff.lint]
+# ★★第一版**只开四条「真错误」规则**，绝不一次全开（理由见 docs/02 §31.3）：
+#   E9  —— 语法 / 解析类错误
+#   F63 —— 无效的 `assert`（如 `assert x, "msg" and 0` 这种写法）
+#   F7  —— 语法上说得通但逻辑必错的写法（`if x == 1 or 2`、`is` 比字面量…）
+#   F82 —— 未定义的名字 ★**这条对本项目最值钱**：一个 `NameError` 会让
+#          `worker` 线程**静默死掉**，用户看到的就是「AI 不回复」。
+#
+# ★放宽的顺序（每档都要先跑 `ruff check --statistics` 看命中数再决定收不收）：
+#   ① 本档（E9/F63/F7/F82）
+#   ② 加 `E`/`W`/`F` 全集（PEP8 与 pyflakes）
+#   ③ 加 `I`（import 排序）
+#   ④ 最后才考虑 `B`（bugbear）/ `SIM`（简化建议）这类风格偏好
+#
+# ★★绝不要用 `ruff format` 或 `ruff check --fix` 去改全项目：
+#   它会把 1.8 万行重排 ⇒ `git diff` 爆炸，而且**会把反向验证 `revNN` 的锚点全部打乱**
+#   （那些锚点是按精确文本匹配的，见 docs/04 §4）。
+select = ["E9", "F63", "F7", "F82"]

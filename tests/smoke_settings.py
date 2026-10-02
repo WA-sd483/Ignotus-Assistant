@@ -120,6 +120,84 @@ check("★`_RUNTIME_ONLY_GENERAL` 只剩 patpat_mode（mute_mode 必须已移出
       tuple(getattr(cfgmod, "_RUNTIME_ONLY_GENERAL", ())) == ("patpat_mode",),
       str(getattr(cfgmod, "_RUNTIME_ONLY_GENERAL", None)))
 
+# ---- ★★原子写（2026-10-01 第三批）：save_config 必须「先写同目录临时文件，再 os.replace」----
+# 为什么单独立一段测：原来是一句 `CONFIG_PATH.write_text(...)`（**边写边覆盖原文件**）——
+#   写到一半崩溃 / 断电 ⇒ config.json 被截断 ⇒ **人设全文、API key、权限白名单一起丢**；
+#   而人设自 2026-09-30 起存的是**全文本身**（docs/02 §25.17）⇒ `persona/*.md` 救不回来 = **不可逆**。
+# ★这里**必须测行为**，不能只核「源码里有没有 os.replace」：真的让写盘 / 换名两步各抛一次，
+#   断言**原文件逐字节没被动过**。（只核表象 = 假绿，本项目吃过这个亏。）
+_cfg_snapshot = '{\n  "general": {"close_action": "tray"},\n  "sentinel": "SNAP"\n}'
+_save_cfg = {"general": {"close_action": "quit"}, "sentinel": "NEW"}
+
+
+def _crash_probe(step):
+    """在 step（'fsync' / 'replace'）处注一次异常，返回 (抛没抛, 原文件没变?, 残留 .tmp)。"""
+    tmp_cfg.write_text(_cfg_snapshot, encoding="utf-8")
+    _real = os.fsync if step == "fsync" else os.replace
+
+    def _boom(*a, **kw):
+        raise RuntimeError("模拟崩溃")
+
+    if step == "fsync":
+        os.fsync = _boom
+    else:
+        os.replace = _boom
+    _raised = False
+    try:
+        cfgmod.save_config(dict(_save_cfg))
+    except RuntimeError:
+        _raised = True
+    finally:
+        if step == "fsync":
+            os.fsync = _real
+        else:
+            os.replace = _real
+    return (_raised,
+            tmp_cfg.read_text(encoding="utf-8") == _cfg_snapshot,
+            [p.name for p in tmp_dir.glob("*.tmp")])
+
+
+for _step, _label in (("fsync", "写盘"), ("replace", "换名")):
+    _raised, _unchanged, _junk = _crash_probe(_step)
+    check("★★原子写：崩在「%s」那一步 ⇒ 异常照旧抛出（调用方一行都不用改）" % _label, _raised)
+    check("★★原子写：崩在「%s」那一步 ⇒ 原 config.json **逐字节未变**（这正是本次改动的意义）" % _label,
+          _unchanged, repr(tmp_cfg.read_text(encoding="utf-8"))[:60])
+    check("★原子写：崩在「%s」那一步 ⇒ 不留 .tmp 垃圾" % _label, _junk == [], str(_junk))
+
+# 正常路径：写完内容正确、且不留 .tmp
+cfgmod.save_config(dict(_save_cfg))
+check("★原子写：正常保存后内容正确（哨兵位已更新）",
+      json.loads(tmp_cfg.read_text(encoding="utf-8")).get("sentinel") == "NEW")
+check("★原子写：正常保存后不留 .tmp 垃圾", [p.name for p in tmp_dir.glob("*.tmp")] == [])
+
+# 结构层（AST 按函数名定位，不用字符串找）：临时文件必须**同目录** + 必须有 fsync + 不再有 write_text
+import ast as _ast  # noqa: E402
+
+_save_node = next(
+    (n for n in _ast.walk(_ast.parse(Path(cfgmod.__file__).read_text(encoding="utf-8")))
+     if isinstance(n, _ast.FunctionDef) and n.name == "save_config"), None)
+check("★`save_config` 函数定位成功（AST）", _save_node is not None)
+_mk_kw = {}
+_has_fsync = _has_replace = _has_write_text = False
+for _n in (_ast.walk(_save_node) if _save_node else []):
+    if not isinstance(_n, _ast.Call) or not isinstance(_n.func, _ast.Attribute):
+        continue
+    if _n.func.attr == "mkstemp":
+        _mk_kw = {k.arg: _ast.unparse(k.value) for k in _n.keywords}
+    elif _n.func.attr == "fsync":
+        _has_fsync = True
+    elif _n.func.attr == "replace":
+        _has_replace = True
+    elif _n.func.attr == "write_text":
+        _has_write_text = True
+check("★★临时文件与 config.json **同目录**（跨盘 ⇒ os.replace 退化成「复制+删除」⇒ 白改；"
+      "★别为了省事改到 %TEMP%）",
+      _mk_kw.get("dir") == "str(CONFIG_PATH.parent)", str(_mk_kw))
+check("★写盘时调 `os.fsync`（否则「改名」可能先于内容落盘 ⇒ 断电得到一个空 config.json）", _has_fsync)
+check("★用 `os.replace` 换名（原子替换）", _has_replace)
+check("★★代码里**不再有** `CONFIG_PATH.write_text(...)`（旧的非原子写法，回来了就是回退）",
+      not _has_write_text)
+
 tmp_cfg.write_text(json.dumps({"general": {"close_action": "tray", "auto_start": False}}), encoding="utf-8")
 cfg = cfgmod.load_config()
 
@@ -2489,8 +2567,8 @@ check("去掉说明后行高仍是 58px（不缩水、也不额外加高）",
 _hdr_lbls = [gen._body_lay.itemAt(i).layout().itemAt(0).widget().text()
              for i in range(gen._body_lay.count())
              if gen._body_lay.itemAt(i).layout() is not None]
-check("分组标题只剩名字本身（启动 / 语音模型 / 模式切换 / 关闭行为 / 桌宠调整），后面不再跟一行说明",
-      _hdr_lbls == ["启动", "语音模型", "模式切换", "关闭行为", "桌宠调整"], str(_hdr_lbls))
+check("分组标题只剩名字本身（启动 / 语音模型 / 模式切换 / 关闭行为 / 桌宠调整 / **帮助**），后面不再跟一行说明",
+      _hdr_lbls == ["启动", "语音模型", "模式切换", "关闭行为", "桌宠调整", "帮助"], str(_hdr_lbls))
 
 gen._set_close_action("quit")
 check("close_action 写入内存配置", cfg["general"]["close_action"] == "quit", str(cfg.get("general")))
@@ -2773,8 +2851,8 @@ def _body_group_names(lay):
     return names
 
 
-check("分组依次是 启动 / 语音模型 / 模式切换 / 关闭行为 / 桌宠调整（前两轮改名；2026-09-22 增「语音模型」）",
-      _body_group_names(gen._body_lay) == ["启动", "语音模型", "模式切换", "关闭行为", "桌宠调整"],
+check("分组依次是 启动 / 语音模型 / 模式切换 / 关闭行为 / 桌宠调整 / **帮助**（前两轮改名；2026-09-22 增「语音模型」；2026-10-02 P2 增「帮助」）",
+      _body_group_names(gen._body_lay) == ["启动", "语音模型", "模式切换", "关闭行为", "桌宠调整", "帮助"],
       str(_body_group_names(gen._body_lay)))
 row_reset = getattr(gen, "_reset_pos_row", None)
 check("通用设置里有「重置角色位置」动作行", isinstance(row_reset, gui._SettingActionRow))
@@ -2865,8 +2943,8 @@ check("左侧文字**只有「音量」二字**、没有说明小字",
       f"{row_vol._title_text} / {row_vol._hint_text!r}")
 
 _groups_vol = _body_group_names(gen._body_lay)
-check("分组名没被这一轮改动（启动 / 语音模型 / 模式切换 / 关闭行为 / 桌宠调整）",
-      _groups_vol == ["启动", "语音模型", "模式切换", "关闭行为", "桌宠调整"], str(_groups_vol))
+check("分组名没被这一轮改动（启动 / 语音模型 / 模式切换 / 关闭行为 / 桌宠调整 / 帮助）",
+      _groups_vol == ["启动", "语音模型", "模式切换", "关闭行为", "桌宠调整", "帮助"], str(_groups_vol))
 _idx_vol = gen._body_lay.indexOf(row_vol)
 _idx_reset = gen._body_lay.indexOf(gen._reset_pos_row)
 check("音量排在「重置角色位置」**之上**（常驻设置在前、一次性动作在后）",
@@ -4587,6 +4665,405 @@ win.set_page_change_cb(None)
 win._switch_right_panel(win.PAGE_CHAT, animate=False)
 win.showNormal()
 app.processEvents()
+
+# ========== 8. 日志设施：未捕获异常必须留痕（2026-10-01 第五批，P1-①）==========
+print("== 8. 日志设施（logging_setup）==")
+import ast as _ast8  # noqa: E402
+import faulthandler as _fh  # noqa: E402
+import logging as _lg  # noqa: E402
+import shutil as _sh  # noqa: E402
+import threading as _th  # noqa: E402
+import time as _tm  # noqa: E402
+from logging.handlers import RotatingFileHandler as _RFH  # noqa: E402
+
+from app import logging_setup as _ls  # noqa: E402
+
+_ROOT = Path(__file__).resolve().parent.parent
+
+# ---- 8.1 模块结构：公开名与根 logger 名 ----
+check("★`app/logging_setup.py` 公开 4 个名（setup / get_logger / log_dir / LOGGER_NAME）",
+      all(hasattr(_ls, n) for n in ("setup", "get_logger", "log_dir", "LOGGER_NAME")),
+      str([n for n in ("setup", "get_logger", "log_dir", "LOGGER_NAME") if not hasattr(_ls, n)]))
+check("★★日志根 logger 名 = `ignotus`（改名会让所有 `get_logger()` 取到的子 logger 失联）",
+      _ls.LOGGER_NAME == "ignotus", _ls.LOGGER_NAME)
+
+
+def _call_lines(src, func, mod=None):
+    """★AST 按 lineno 找调用（**不能用 `src.index()`** —— 注释里出现同样的字就会假红）。"""
+    out = []
+    for node in _ast8.walk(_ast8.parse(src)):
+        if not isinstance(node, _ast8.Call):
+            continue
+        f = node.func
+        if isinstance(f, _ast8.Attribute) and f.attr == func:
+            v = f.value
+            if mod is None or (isinstance(v, _ast8.Name) and v.id == mod):
+                out.append(node.lineno)
+        elif mod is None and isinstance(f, _ast8.Name) and f.id == func:
+            out.append(node.lineno)
+    return out
+
+
+_src_run = (_ROOT / "run.py").read_text(encoding="utf-8")
+_src_main_new = (_ROOT / "app" / "main.py").read_text(encoding="utf-8")
+_src_pipe_new = (_ROOT / "app" / "pipeline.py").read_text(encoding="utf-8")
+
+# ---- 8.2 run.py：钩子必须**早于** import app.main（否则导入期崩了没痕迹）----
+_c_run = _call_lines(_src_run, "_setup_logging")
+_i_run = [n.lineno for n in _ast8.walk(_ast8.parse(_src_run))
+          if isinstance(n, _ast8.ImportFrom) and n.module == "app.main"
+          and any(a.name == "main" for a in n.names)]
+check("★run.py：`_setup_logging()` 的调用**早于** `from app.main import main`（AST 按 lineno 判）",
+      bool(_c_run) and bool(_i_run) and min(_c_run) < min(_i_run),
+      f"call@{_c_run} import@{_i_run}")
+
+# ---- 8.3 main()：必须自己调 setup()（★exe 走 entry.py，不经过 run.py）----
+_main_tree = _ast8.parse(_src_main_new)
+_main_fn = next((n for n in _ast8.walk(_main_tree)
+                 if isinstance(n, _ast8.FunctionDef) and n.name == "main"), None)
+_setup_in_main = [n.lineno for n in (_ast8.walk(_main_fn) if _main_fn else [])
+                  if isinstance(n, _ast8.Call) and isinstance(n.func, _ast8.Attribute)
+                  and n.func.attr == "setup"
+                  and isinstance(n.func.value, _ast8.Name)
+                  and n.func.value.id == "logging_setup"]
+check("★★main() 函数体内调了 `logging_setup.setup()` —— 打包形态 `entry.py` 不经过 run.py，"
+      "只挂 run.py 会让 exe 完全没有日志",
+      bool(_setup_in_main), f"行号 {_setup_in_main}")
+
+# ---- 8.4 六处静默死亡点的 LOG.exception 落点（按「所在函数」限定，不只数总数）----
+def _func_of(tree):
+    """{函数名: [该函数**自身**调用过的 (attr/name, lineno)]}。
+
+    ★★必须**剪掉嵌套作用域**：`worker` / `init_asr` / `on_event` 全是嵌套在 `main()`
+    里的闭包 —— 若一路 `ast.walk` 下潜，`main` 就会把它们里的 `LOG.exception` 也
+    算成自己的，于是「main 里恰好 1 处」这条断言会**永远统计错误**（假红/假绿都来过）。
+    """
+    def own_calls(fn):
+        out, stack = [], list(fn.body)
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (_ast8.FunctionDef, _ast8.AsyncFunctionDef,
+                              _ast8.ClassDef, _ast8.Lambda)):
+                continue                      # ★不下潜：嵌套函数里的调用算它自己的
+            if isinstance(n, _ast8.Call):
+                f = n.func
+                nm = f.attr if isinstance(f, _ast8.Attribute) else (
+                    f.id if isinstance(f, _ast8.Name) else None)
+                out.append((nm, n.lineno))
+            stack.extend(_ast8.iter_child_nodes(n))
+        return out
+
+    return {fn.name: own_calls(fn)
+            for fn in _ast8.walk(tree) if isinstance(fn, _ast8.FunctionDef)}
+
+
+_mcalls = _func_of(_main_tree)
+check("★★main.py `worker` 里 2 处 `LOG.exception`（流式失败 / 非流式回退失败）"
+      "—— 「AI 不回复」的根源，以前是光秃秃的 `failure = True`",
+      sum(1 for nm, _ in _mcalls.get("worker", []) if nm == "exception") == 2,
+      str([l for nm, l in _mcalls.get("worker", []) if nm == "exception"]))
+check("★★main.py `init_asr` 里 1 处 `LOG.exception` —— 「唤不醒」的根源",
+      sum(1 for nm, _ in _mcalls.get("init_asr", []) if nm == "exception") == 1,
+      str(_mcalls.get("init_asr")))
+check("★main.py `main()` **自身**里 1 处 `LOG.exception` —— TTS 后台拉起失败"
+      "（「没声音」根源；★剪掉嵌套闭包后才是 1，不剪会数成 4）",
+      sum(1 for nm, _ in _mcalls.get("main", []) if nm == "exception") == 1,
+      str([l for nm, l in _mcalls.get("main", []) if nm == "exception"]))
+
+_ptree = _ast8.parse(_src_pipe_new)
+_pcalls = _func_of(_ptree)
+_pipe_exc = [l for fn in ("_run",) for nm, l in _pcalls.get(fn, []) if nm == "exception"]
+check("★★pipeline.py `_run` 里 2 处 `LOG.exception`（合成失败 / 播放失败）—— 「有字没声」的根源",
+      len(_pipe_exc) == 2, str(_pipe_exc))
+check("★pipeline.py 仍然**不 import tts**（函数注入那条契约没被日志改动打破）"
+      "　★只认 AST：docstring 里就写着「本模块不 import tts」，substring 一撞就假红",
+      not any(isinstance(n, _ast8.ImportFrom) and n.module == "tts"
+              for n in _ast8.walk(_ptree))
+      and not any(isinstance(n, _ast8.Import)
+                  and any(a.name == "tts" for a in n.names)
+                  for n in _ast8.walk(_ptree)),
+      str([getattr(n, "module", None) or [a.name for a in getattr(n, "names", [])]
+           for n in _ast8.walk(_ptree) if isinstance(n, (_ast8.Import, _ast8.ImportFrom))]))
+
+# ---- 8.5 行为层：真跑一遍（★只写 IGNOTUS_LOG_DIR 指定的临时目录）----
+_ls_tmp = Path(tempfile.mkdtemp(prefix="ignotus_logcheck_"))
+_old_env = os.environ.get("IGNOTUS_LOG_DIR")
+_old_seh, _old_teh = sys.excepthook, _th.excepthook
+os.environ["IGNOTUS_LOG_DIR"] = str(_ls_tmp)
+
+
+def _ls_reset():
+    """清干净 logger 与全局钩子，好让 `setup()` 能再跑一次（它是幂等的，需先拆）。"""
+    lg = _lg.getLogger(_ls.LOGGER_NAME)
+    for h in list(lg.handlers):
+        lg.removeHandler(h)
+        try:
+            h.close()
+        except Exception:  # noqa: BLE001
+            pass
+    for a in ("_ignotus_ready", "_ignotus_path"):
+        if hasattr(lg, a):
+            delattr(lg, a)
+    try:
+        _fh.disable()
+    except Exception:  # noqa: BLE001
+        pass
+    if _ls._fault_file is not None:
+        try:
+            _ls._fault_file.close()
+        except Exception:  # noqa: BLE001
+            pass
+        _ls._fault_file = None
+    sys.excepthook = _old_seh
+    _th.excepthook = _old_teh
+
+
+try:
+    _ls_reset()
+    _ls_path = _ls.setup()
+    _ls_logf = _ls_tmp / "app.log"
+
+    check("★★setup() 真的建出了 app.log 文件", _ls_logf.exists(), str(_ls_tmp))
+    _lg_root = _lg.getLogger(_ls.LOGGER_NAME)
+    check("★装上恰好 1 个 handler，且是 RotatingFileHandler（会滚动，不撑爆磁盘）",
+          len(_lg_root.handlers) == 1 and isinstance(_lg_root.handlers[0], _RFH),
+          str([type(h).__name__ for h in _lg_root.handlers]))
+    check("★★`propagate` 为 False —— 否则 sherpa/onnx/Qt 的噪音会把日志刷爆",
+          _lg_root.propagate is False, _lg_root.propagate)
+
+    _ls.get_logger("smoke").warning("smoke-标记-xyz")
+    check("★子 logger 的消息能写进 app.log",
+          "smoke-标记-xyz" in _ls_logf.read_text(encoding="utf-8", errors="ignore"))
+
+    check("★★sys.excepthook 已被替换（主线程未捕获异常有救了）",
+          sys.excepthook is not sys.__excepthook__)
+    check("★★threading.excepthook 已被替换 —— `sys.excepthook` **只管主线程**，"
+          "子线程异常唯一能接住的就是它（daemon 线程正是靠它才不再「静默死」）",
+          _th.excepthook is not _th.__excepthook__)
+    check("★faulthandler 已启用 + crash.log 就位（原生崩溃 excepthook 抓不到）",
+          _fh.is_enabled() and (_ls_tmp / "crash.log").exists(),
+          f"enabled={_fh.is_enabled()}")
+
+    # 子线程未捕获异常
+    _sz0 = _ls_logf.stat().st_size
+    _t = _th.Thread(target=lambda: (_ for _ in ()).throw(RuntimeError("smoke-probe")),
+                    name="smoke-probe-thread", daemon=True)
+    _t.start()
+    _t.join(5.0)
+    _tm.sleep(0.25)
+    _body = _ls_logf.read_text(encoding="utf-8", errors="ignore")
+    check("★★子线程未捕获异常**留痕了**（日志从 %d 字节涨到 %d）"
+          % (_sz0, _ls_logf.stat().st_size),
+          _ls_logf.stat().st_size > _sz0)
+    check("★★留的是**完整调用栈**（含 Traceback 与真实异常行）",
+          "Traceback" in _body and "RuntimeError" in _body)
+    check("★★记下了**是哪个线程**（daemon 线程「谁死了」从此有据可查）",
+          "smoke-probe-thread" in _body)
+
+    # 主线程
+    _sz1 = _ls_logf.stat().st_size
+    try:
+        raise ValueError("smoke-main-probe")
+    except ValueError:
+        sys.excepthook(*sys.exc_info())
+    _body = _ls_logf.read_text(encoding="utf-8", errors="ignore")
+    check("★★主线程未捕获异常也留痕，且标注「主线程」",
+          _ls_logf.stat().st_size > _sz1 and "主线程" in _body and "smoke-main-probe" in _body)
+
+    # 幂等
+    _n_h = len(_lg_root.handlers)
+    _p_again = _ls.setup()
+    check("★setup() 幂等：重复调用不叠加 handler、返回同一路径",
+          len(_lg_root.handlers) == _n_h and _p_again == _ls_path,
+          f"handlers={len(_lg_root.handlers)} path={_p_again}")
+
+    # ★反向对照：把 threading.excepthook 换回默认 ⇒ 必须「什么都不留」
+    #   ★默认钩子会把 traceback 打到 stderr（pythonw 下 stderr 就是 devnull ⇒ 等于丢进垃圾桶）。
+    #   这里临时把 stderr 也换成 devnull，只为让测试输出干净；**不改对照组的语义**。
+    _th.excepthook = _th.__excepthook__
+    _sz2 = _ls_logf.stat().st_size
+    _devnull = open(os.devnull, "w", encoding="utf-8")
+    _old_stderr, sys.stderr = sys.stderr, _devnull
+    try:
+        _t2 = _th.Thread(target=lambda: (_ for _ in ()).throw(RuntimeError("smoke-no-hook")),
+                         name="smoke-no-hook-thread", daemon=True)
+        _t2.start()
+        _t2.join(5.0)
+        _tm.sleep(0.25)
+    finally:
+        sys.stderr = _old_stderr
+        _devnull.close()
+    check("★★反向对照：移除 `threading.excepthook` 后子线程异常**再也不留痕**"
+          "（证明上面那条断言不是摆设，也复现了「改造前」的真实状态）",
+          _ls_logf.stat().st_size == _sz2,
+          f"仍增长了 {_ls_logf.stat().st_size - _sz2} 字节")
+finally:
+    _ls_reset()
+    if _old_env is None:
+        os.environ.pop("IGNOTUS_LOG_DIR", None)
+    else:
+        os.environ["IGNOTUS_LOG_DIR"] = _old_env
+    _sh.rmtree(_ls_tmp, ignore_errors=True)
+
+# ========== 9. 依赖锁定 / ruff / CI（2026-10-01 第五批，P1-②③）==========
+print("== 9. 依赖锁定 + ruff + CI ==")
+
+# ---- 9.1 requirements.txt：每一行运行依赖都必须带 `==` ----
+_req_lines = [ln.strip() for ln in
+              (_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()]
+_req_deps = [ln for ln in _req_lines if ln and not ln.startswith("#")]
+_req_bare = [ln for ln in _req_deps if "==" not in ln]
+check("★★requirements.txt 的**每一条**运行依赖都锁死了版本（没有裸包名）"
+      "—— 本项目对 Qt 行为极度敏感，不锁 ⇒ 用户装到新大版本时行为会静默改变",
+      bool(_req_deps) and not _req_bare, f"裸包名 = {_req_bare}")
+check("★requirements.txt 锁了 7 个包（PySide6 必须在列）",
+      len(_req_deps) == 7 and any(l.lower().startswith("pyside6") for l in _req_deps),
+      str(_req_deps))
+
+# ---- 9.2 pyproject.toml：只配 ruff，且**故意不含 [project]** ----
+try:
+    import tomllib as _toml  # noqa: E402  （3.11+ 标准库）
+    _pyt = _toml.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    _ruff = _pyt.get("tool", {}).get("ruff", {})
+    _sel = _ruff.get("lint", {}).get("select", [])
+    check("★★pyproject.toml 存在、能解析、且**故意没有 `[project]` 表**"
+          "（有它 pip 就会把本目录当可安装包，会波及打包流程）",
+          "project" not in _pyt, str(list(_pyt.keys())))
+    check("★★ruff 只开了四条「真错误」规则 E9 / F63 / F7 / F82"
+          "（F82 未定义名最值钱：一个 NameError 会让 worker 线程静默死）",
+          sorted(_sel) == sorted(["E9", "F63", "F7", "F82"]), str(_sel))
+    check("★ruff 的 exclude 里有 IA_build（打包工作区含 vendored setuptools，扫了全是噪音）",
+          "IA_build" in _ruff.get("exclude", []), str(_ruff.get("exclude")))
+except ModuleNotFoundError:      # pragma: no cover
+    check("（跳过）本机 Python 不带 tomllib", True)
+
+# ---- 9.3 CI：只跑静态卡口，绝不硬跑 run_all ----
+_ci = _ROOT / ".github" / "workflows" / "ci.yml"
+_ci_txt = _ci.read_text(encoding="utf-8") if _ci.exists() else ""
+check("★`.github/workflows/ci.yml` 存在", _ci.exists())
+check("★CI 跑了 `ruff check`（静态检查）", "ruff check" in _ci_txt)
+check("★CI 跑了 `compileall`（抓 SyntaxError，且**不需要装 PySide6**）",
+      "compileall" in _ci_txt)
+# ★只认 `run:` 行（真正会被执行的 shell 命令）—— 注释里就写着「为什么不挂 run_all」，
+#   按全文 substring 判定会假红。这是本项目第 3 次踩「拿文字当结构」的坑。
+_ci_runs = [ln.strip() for ln in _ci_txt.splitlines() if ln.strip().startswith("run:")]
+check("★★CI **没有**硬跑 `tests/run_all.py` —— runner 上没有音频设备 / 229MB 模型，"
+      "硬跑只会得到一片假红，把 CI 变成「永远挂着的红叉」",
+      bool(_ci_runs) and not any("run_all" in l for l in _ci_runs), str(_ci_runs))
+check("★CI 的两条 `run:` = 装 ruff + ruff check + compileall（共 3 条）",
+      len(_ci_runs) == 3
+      and any("ruff==" in l for l in _ci_runs)
+      and any("ruff check" in l for l in _ci_runs)
+      and any("compileall" in l for l in _ci_runs),
+      str(_ci_runs))
+check("★ci.yml 用空格缩进（YAML 禁止 TAB）", "\t" not in _ci_txt)
+check("★ci.yml 钉住了 ruff 版本号（可复现）", "ruff==" in _ci_txt)
+
+print("== 10. 静态卫生：ruff 抓得到、但项目还要额外钉住的坑 ==")
+# 背景（2026-10-02）：接上 ruff 后第一次跑，F821 就抓出 `app/main.py` 一处**真 bug** ——
+#   `except Exception as e:` 块里定义了一个引用 `e` 的 lambda；而 Python 在 except 块
+#   **结束时会 `del e`**（连闭包里的 cell 一起清空）⇒ 那个 lambda 被 QTimer 稍后调用时
+#   必抛 NameError，界面灰字「语音识别未就绪：<原因>」**从来没显示过**。
+#   下面两条把这个「类」钉死；两条都按**结构**核，不按文字核。
+
+# ---- 10.1 `except ... as NAME:` 里，被「延迟调用」的 lambda / 内层 def 引用的 NAME ----
+
+
+def _deferred_except_refs(tree):
+    """返回 [(行号, NAME, 类型名), ...]：except-as 的目标被「稍后才跑」的闭包引用。"""
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler) or not node.name:
+            continue
+        for sub in ast.walk(node):
+            if sub is node:
+                continue
+            if isinstance(sub, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)):
+                loaded = {n.id for n in ast.walk(sub)
+                          if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+                if node.name in loaded:
+                    found.append((sub.lineno, node.name, type(sub).__name__))
+    return found
+
+
+_scan_files = (sorted((_ROOT / "app").glob("*.py")) + [_ROOT / "run.py"]
+               + sorted((_ROOT / "tests").glob("*.py"))
+               + sorted((_ROOT / "tools").glob("*.py")))
+_bad_exc = []
+for _p in _scan_files:
+    try:
+        _tree = ast.parse(_p.read_text(encoding="utf-8"))
+    except SyntaxError:            # 语法错归 compileall / ruff 管，这里不重复报
+        continue
+    for _ln, _nm, _kind in _deferred_except_refs(_tree):
+        _bad_exc.append(f"{_p.name}:{_ln}（{_kind} 引用 except 目标 {_nm!r}）")
+check("★★全仓库没有「`except ... as X:` 块里定义 lambda / 内层 def、却去引用 X」——"
+      "Python 在 except 块结束时会 `del X`（连闭包 cell 一起清空），这种 lambda 被 QTimer / "
+      "后台线程稍后调用时必抛 NameError；而 stderr 在打包形态早被兜到 devnull ⇒ **静默**",
+      not _bad_exc, str(_bad_exc))
+
+# ---- 10.2 无效的 noqa 指令（ruff 只 warning、**不 fail**，所以必须自己钉）----
+# 本节点局部导入，不动文件头
+import io as _io          # noqa: E402
+import re as _re          # noqa: E402
+import tokenize as _tk    # noqa: E402
+
+_NOQA_RE = _re.compile(r"#\s*noqa(?P<tail>[^\n]*)", _re.IGNORECASE)
+_CODE_RE = _re.compile(r"^[A-Z]+[0-9]+$")
+
+
+def _invalid_noqa(src):
+    """返回 [(行号, 说明), ...]。判据**照抄 ruff**（2026-10-02 用 13 种写法实测校准）。
+
+    ★两处关键：
+      ① 必须走 `tokenize` 只认**真注释** —— 本文件自己的断言名 / docstring 里就写着
+         「noqa 后面直接粘中文」这种**例子**，按「逐行正则」扫会把**字符串字面量**
+         一起当成指令 ⇒ 守卫把守卫自己抓红（第一次跑就是这么红的，第 4 次踩「拿文字当结构」）。
+      ② `noqa` 后面「既不是冒号、也不是空白」也算无效（如反引号、紧跟字母）；
+         `# noqa: 冒号后空` 同样无效。
+    """
+    found = []
+    try:
+        toks = list(_tk.generate_tokens(_io.StringIO(src).readline))
+    except (_tk.TokenError, IndentationError, SyntaxError):
+        return found
+    for tok in toks:
+        if tok.type != _tk.COMMENT:
+            continue
+        m = _NOQA_RE.search(tok.string)
+        if not m:
+            continue
+        tail = m.group("tail")
+        stripped = tail.lstrip()
+        if not stripped:
+            continue                                   # 裸 noqa：合法
+        if stripped[0] != ":":
+            if not tail[0].isspace():
+                found.append((tok.start[0], "noqa 后面既不是冒号也不是空白"))
+            continue                                   # `noqa 后面跟中文说明`：ruff 当裸指令，合法
+        codes = stripped[1:]
+        if not codes.strip():
+            found.append((tok.start[0], "冒号后没有 code"))
+            continue
+        for part in codes.split(","):
+            head = part.strip().split()                # ★判据与 ruff 对齐：取「首个空白前」的文本
+            head_tok = head[0] if head else ""
+            if head_tok and not _CODE_RE.match(head_tok):
+                found.append((tok.start[0], f"非法 code {head_tok!r}"))
+    return found
+
+
+_bad_noqa = []
+for _p in _scan_files:
+    for _ln, _tok in _invalid_noqa(_p.read_text(encoding="utf-8")):
+        _bad_noqa.append(f"{_p.name}:{_ln}（{_tok!r}）")
+check("★★全仓库的 `# noqa: XXX` 都是**合法指令**（判据与 ruff 一致：逗号分段后取「首个空白前的"
+      "文本」，须形如 `F401`；且只认 tokenize 出来的真注释）—— 代码后面直接粘中文说明会让整条"
+      "指令**作废**：该压的告警压不住，还白送一条 warning",
+      not _bad_noqa, str(_bad_noqa))
+check("★`# noqa: N802 (Qt 命名)` 这种「代码 + 空格 + 括号说明」的写法**必须仍然合法**"
+      "（全项目 70+ 处都这么写；守卫若写成一刀切，一改就满屏假红）",
+      _CODE_RE.match("N802 (Qt 命名)".split()[0]) is not None)
 
 print()
 print(f"共 {total[0]} 项断言，失败 {len(fails)} 项")

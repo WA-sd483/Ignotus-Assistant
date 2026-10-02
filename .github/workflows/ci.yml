@@ -1,0 +1,45 @@
+# ★CI 的定位是「入口设卡」，**不是**替代 run_all 的回归。
+#
+# 为什么不挂 `tests/run_all.py`：
+#   那 9 套里有 6 套要**真实 GUI + 真实音频设备 + 真机 GPT-SoVITS / ASR 模型**
+#   （`smoke_pet` 还带着一个原生音频后端的偶发挂点，见 TECH-GOTCHAS §六）。
+#   GitHub 免费 runner 既没有音频设备，也没有那 229 MB 模型；
+#   硬跑只会得到一片假红，把 CI 变成「永远挂着的红叉」⇒ 之后就没人再看它了。
+#
+# 真正的回归仍然在本机跑 `docs/04 §0` 那套收尾流程（离线自检 → revNN → run_all）。
+#
+# 所以这里只做两件**不依赖环境**的事：
+#   ① ruff check —— 静态检查，零运行时风险
+#   ② compileall —— 全量语法编译，★能一次性抓出所有 SyntaxError（几秒跑完，且不需要装 PySide6）
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  static:
+    name: 静态卡口（ruff + compileall）
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # ★钉住 ruff 版本：实际规则集由 pyproject.toml 的 `select` 决定，
+      #   钉版本只为「同样是这段代码，今天和半年后跑出一样的结果」。
+      #   升这一行时顺带看一眼 `--statistics` 的命中数有没有变。
+      - name: 装 ruff
+        run: pip install ruff==0.16.9
+
+      - name: ruff check（只开 E9 / F63 / F7 / F82 四条真错规则）
+        run: ruff check app/ tests/ run.py
+
+      # ★这一条**不需要装 PySide6** —— compileall 只做语法编译，不 import。
+      #   它抓的是「改代码改出语法错」这种最低级、也最容易手滑的问题。
+      - name: 语法编译（抓 SyntaxError）
+        run: python -m compileall -q app/ run.py

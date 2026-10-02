@@ -462,7 +462,8 @@ print("== 10e. 「打开类」动作提示 + 唤醒招呼（2026-09-30 用户口
 # 背景（用户报的两件事）：
 #   ① 让爱丽丝「打开某文件夹 / 网站」时，她回「不清楚…」**却照样执行** ⇒ 言行不一致；
 #   ② 初次唤醒的招呼**老是同一句**。下面①查纯函数行为（真调），②查接线（AST，不按行号）。
-from app import main as mainmod  # noqa: E402（模块级只有定义；import 不会起 QApplication）
+# 模块级只有定义；import 不会起 QApplication
+from app import main as mainmod  # noqa: E402
 
 _h_path = mainmod._pending_action_hint({"type": "open_path", "label": "桌面"})
 check("open_path：把「马上会打开」告诉 AI（前缀 [将执行]，别再答『不清楚』）",

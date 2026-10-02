@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PY = str(ROOT / ".venv" / "Scripts" / "python.exe")
 SUITES = ["smoke_settings", "smoke_permissions", "smoke_api", "smoke_tts",
           "smoke_autostart", "smoke_pipeline", "smoke_pet", "smoke_sleep",
-          "reply_probe"]
+          "reply_probe", "smoke_health"]
 
 # 单套件硬超时。**必须**有：smoke_pet 里有一处已知的时序赛跑（脚本里写着「单跑绿、全量跑红」），
 # 偶发会让那一套**卡死**（本文件实测踩过两次：跑到 smoke_pet 就再也不往下走）。

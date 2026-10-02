@@ -1,8 +1,26 @@
-# 运行依赖
-PySide6
-Pillow
-openai
-sherpa-onnx
-sounddevice
-numpy
-imageio-ffmpeg
+# 运行依赖 —— ★★全部锁死版本（2026-10-01 第五批）
+#
+# 为什么必须锁：
+#   本项目对 **Qt 行为**极度敏感 —— `docs/02` 里登记着一长串「某个 Qt 版本下正好是这样」
+#   的坑（弹窗必须 `Qt.WindowModal` 而非 `setModal(True)`、不能用 `QMenu`、
+#   `heightForWidth()` 不能用、滚动区文本控件必须 `setWordWrap` …）。
+#   不锁版本 ⇒ 用户 `pip install` 到未来某个大版本时，这些行为会**静默改变**，
+#   而且在你自己的机器上**复现不出来**（因为你装的是下面这一组）。
+#   同时 `sherpa-onnx` / `numpy` 是平台相关的二进制包，版本漂移的后果更不可预测。
+#
+# 下面这组 = 本机 venv 实测（`pip freeze`），也是 2026-10-01 跑完 2368+ 项测试的那一组。
+#
+# ★升级时怎么做：改这里的版本号 ⇒ **必须跑一遍 `tests/run_all.py` 看 `ALL_OK`**
+#   （做法见 `docs/04 §0`）。★别只改一处：`PySide6` 与 `shiboken6` 是同版本号连体的。
+#
+# ★★别把这份文件与 GPT-SoVITS 的 `requirements_cpu.txt` 混为一谈：
+#   那份是音色克隆流水线用的（`torch` CPU 版 + onnxruntime 等，≈2.4 GB），
+#   由 `docs/02 §22` 的下载流水线单独安装，**不在本文件里**。
+
+PySide6==6.11.2
+Pillow==12.3.0
+openai==3.3.1
+sherpa-onnx==1.13.6
+sounddevice==0.5.6
+numpy==2.5.2
+imageio-ffmpeg==0.6.0

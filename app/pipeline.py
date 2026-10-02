@@ -28,6 +28,12 @@
 """
 import threading
 
+from .logging_setup import get_logger
+
+# 本模块的 logger。★`pipeline` 只依赖 `logging_setup`（标准库 + 本模块），
+# 不会产生循环导入 —— 它与 `tts` 之间那条「不 import」的约束**不受影响**。
+LOG = get_logger("pipeline")
+
 # 中文迟迟不来时的兜底：不能把合成线程无限期挂在闸门上
 _GATE_TIMEOUT = 60.0
 # 没有音频可播（静音 / 静音模式 / 合成失败）时，「说话态」该持续多久（秒）。
@@ -122,6 +128,8 @@ class SpeakPipeline:
             try:
                 path = self._synth(text)
             except Exception:  # noqa: BLE001
+                # ★2026-10-01：「没声音」的两大根源之一。以前完全静默。
+                LOG.exception("合成失败 ⇒ 本条只有文字、没有声音")
                 path = None     # 合成失败不该把线程带崩：文字照常显示，只是没声音
         if self._cancel.is_set():
             self._cleanup(path)
@@ -149,7 +157,9 @@ class SpeakPipeline:
             try:
                 self._play(path, reveal)
             except Exception:  # noqa: BLE001
-                pass
+                # ★另一大根源：音频设备打开失败 / 播放中断。`finally` 里的 `reveal()`
+                #   仍会放行文字（这一点没动），但「为什么没声音」现在有据可查。
+                LOG.exception("播放失败（音频设备或解码问题）⇒ 文字照常，这段没声音")
             finally:
                 # 保险：play 没回调（异常 / 老实现）也必须把文字放出来，不能把回复吞掉
                 reveal()

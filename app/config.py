@@ -1,6 +1,8 @@
 """配置加载与保存。"""
 import copy
 import json
+import os
+import tempfile
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent          # IgnotusAssistant/
@@ -403,12 +405,46 @@ _RUNTIME_ONLY_GENERAL = ("patpat_mode",)
 
 
 def save_config(cfg: dict) -> None:
+    """把配置落盘。★**原子写**（2026-10-01）—— 为什么必须这样写见下方长注释。"""
     data = dict(cfg)
     general = data.get("general")
     if isinstance(general, dict):
         data["general"] = {
             k: v for k, v in general.items() if k not in _RUNTIME_ONLY_GENERAL
         }
-    CONFIG_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+
+    # ★★原子写（2026-10-01 第三批）：**先写同目录临时文件，写完整了再 `os.replace` 改名顶上。**
+    #
+    # 原来是一句 `CONFIG_PATH.write_text(...)` —— 那是**边写边覆盖原文件**：
+    # 写到一半崩溃 / 断电 ⇒ `config.json` 被截断 ⇒ **人设全文、API key、权限白名单一起丢**。
+    # 而人设自 2026-09-30 起存的是**全文本身**（不再是 `persona/*.md` 路径，见 docs/02 §25.17）
+    # ⇒ 那份 `.md` 素材**救不回来** —— 这是**不可逆**的数据丢失。
+    #
+    # 三个「必须这样写」的点（改这个函数前先读）：
+    #   ① 临时文件**必须与 config.json 同目录**（`dir=CONFIG_PATH.parent`）——
+    #      `os.replace` 只在**同一分区**内才是原子的；跨盘会退化成「复制 + 删除」，
+    #      等于白改。**别图省事改到 `%TEMP%` 去。**
+    #   ② **必须 `os.fsync`** —— 否则「改名」这个元数据操作可能**先于**文件内容落盘，
+    #      断电会得到一个「名字对、内容却是空的」config.json。
+    #   ③ 失败要**清掉临时文件**再抛（不能留 `.tmp` 垃圾），且兜 `BaseException`
+    #      （Ctrl+C / 进程被杀也要清）。
+    #
+    # 行为契约**没变**：成功时 `config.json` 里就是新内容；失败时照旧抛异常
+    #   （调用方一行都不用改；2026-10-01 实测 22 处 = `gui.py` 17 + `main.py` 5）。
+    #   唯一的区别是**失败时原文件完好无损**。
+    fd, tmp = tempfile.mkstemp(
+        prefix="config.", suffix=".tmp", dir=str(CONFIG_PATH.parent)
     )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_PATH)          # ★一步换名：要么全成、要么不变
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
