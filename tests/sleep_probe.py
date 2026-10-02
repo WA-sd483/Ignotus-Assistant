@@ -133,9 +133,13 @@ import app.main as m  # noqa: E402
 
 # 受控配置：静音模式**开**、带一个假 API（`_ask_ai` 不配 key 会直接短路）
 CFG = {
-    "apis": [{"name": "T", "api_key": "sk-test", "base_url": "https://api.deepseek.com",
-              "model": "deepseek-flash"}],
-    "current_api": "T",
+    # ★2026-10-02 起 API 是**每个角色一份独立列表**（`{角色key: [条目,…]}`）。
+    #   本探针把 CFG 直接塞给 `m.load_config` 的替身（**不走真的 `load_config`**），
+    #   所以「旧扁平结构自动迁移到 alice」那条兜底**不会**生效 ⇒ 这里必须自己写成新结构，
+    #   否则 `apis_for()` 拿到的是个 list、直接回 `[]` ⇒ `_ask_ai` 直接短路成「没配 API」。
+    "apis": {"alice": [{"name": "T", "api_key": "sk-test", "base_url": "https://api.deepseek.com",
+                        "model": "deepseek-flash"}]},
+    "current_api": {"alice": "T"},
     "current_role": "alice",
     "volume": 0.5,
     "general": {"auto_start": False, "close_action": "tray", "mute_mode": True},

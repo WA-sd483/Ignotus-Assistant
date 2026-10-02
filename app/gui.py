@@ -64,16 +64,23 @@ DLG_BTN_GHOST_HOVER = "#F1F5F9"
 DLG_BTN_RUN_TEXT = "立刻执行"       # 通用文案：关机 / 重启 / 注销…都用它
 DLG_BTN_CANCEL_TEXT = "取消"
 
-from .config import (DEFAULT_BASE_URL, DEFAULT_MODEL,
-                     is_role_switchable, resolve_persona_text, save_config)
+from .config import (DEFAULT_BASE_URL, DEFAULT_MODEL, apis_for, current_api_name,
+                     get_current_api, is_role_switchable, resolve_persona_text, role_keys,
+                     save_config, set_current_api)
 # ★is_role_switchable：角色的可切换性真值（docs/02 §24）
 # ★resolve_persona_text：人设取值的**唯一入口**（「查看」弹窗用它，别再自己读文件；docs/02 §25.17）
+# ★apis_for / current_api_name / get_current_api / role_keys / set_current_api：API 现在是
+#   **每个角色一份独立列表**（2026-10-02），「取谁的 API」必须走这几个入口 —— 别在界面里
+#   直接翻 `cfg["apis"]`，翻错一层就会变成「改了爱丽丝的、艾莲的跟着动」这种静默漂移。
 from .volume import VolumeSlider, VolumeStepButton
 from .state import State
+# ★各家的接口地址 / 模型清单（「添加 API」两个下拉框的数据源）。纯数据、不 import Qt。
+#   ⚠️它**不是白名单** —— 下拉框可编辑，用户手输的任意地址/模型都必须照收，见模块抬头。
+from . import providers
 from . import voice_model
 from . import voice_download
 # ★P2（2026-10-02）：诊断内核与更新内核。两者都**不 import Qt**，
-#   判据全在那边（同一份结论给「引导 / 状态条 / 自检」三段 UI，见 app/health.py 抬头）。
+#   判据全在那边（同一份结论给「引导 / 提示区 / 自检」几段 UI，见 app/health.py 抬头）。
 from . import health
 from . import update
 # ★版本号的**唯一真值**在 `app/__init__.py`（检查更新拿它跟 GitHub 的 tag 比）
@@ -210,14 +217,36 @@ class HoverComboBox(QComboBox):
     def _apply_hover(self, t):
         self._hover = float(t)
         bg = self._lerp_color("#F6FAFF", "#DCDCDC", self._hover)
+        # ★★右侧内边距要**按"是否可编辑"分两档**（2026-10-02，`rev50` 实测）：
+        #   `QComboBox::drop-down` 自己就占了 30px，而 Qt 又按 `padding-right` 再让一次位
+        #   ⇒ 两份叠加，编辑框实际只剩 **236px**（310 − 12 − 30 − 30 − 2），长地址
+        #   （「千问 Qwen · https://dashscope.aliyuncs.com/compatible-mode/v1」要 400+px）
+        #   被裁得更厉害。可编辑的那两个（卡片里的地址 / 模型）只留 12px ⇒ **266px**。
+        #   ★非可编辑的（主界面「切换角色」/「当前 API」那些）**别动** —— 它们的文本是
+        #     走 item 渲染的，右边 30px 是留给箭头不被文字压住的。
+        pad_r = 12 if self.isEditable() else 30
         self.setStyleSheet(
-            "QComboBox { background:#F6FAFF; border:1px solid #7DD3FC; border-radius:15px; padding:6px 30px 6px 12px; }"
+            "QComboBox { background:#F6FAFF; border:1px solid #7DD3FC; border-radius:15px; "
+            f"padding:6px {pad_r}px 6px 12px; }}"
             "QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: center right; "
             f"width:30px; height:30px; border:none; border-radius:15px; background:{bg}; margin-right:0; }}"
             f"QComboBox::down-arrow {{ image:url({_ARROW_GRAY}); width:15px; height:15px; }}"
+            # ★可编辑下拉（`setEditable(True)`，2026-10-02「添加 API」的地址/模型下拉）
+            #   内部自带一个 `QLineEdit`。卡片弹窗那套样式里有一条**裸的** `QLineEdit{…}`
+            #   （胶囊底 + 描边，`_CARD_EDIT_QSS`）—— 一旦它命中内部那个编辑框，就会出现
+            #   「胶囊里再套一个胶囊」的双层边框。这里把它抹平（后代选择器比裸标签更具体，
+            #   优先级更高）。★非可编辑的 combo 内部没有编辑框，这条对它们是空转。
+            "QComboBox QLineEdit { background:transparent; border:none; padding:0; color:#334155; }"
             "QComboBox QAbstractItemView { background:#FFFFFF; border:1px solid #7DD3FC; "
             "border-radius:8px; selection-background-color:#E6F1FB; selection-color:#0C447C; }"
         )
+
+    def setEditable(self, editable: bool):
+        super().setEditable(editable)
+        # ★`padding-right` 要按"是否可编辑"分档（见 `_apply_hover` 的注释），
+        #   而 `__init__` 里那次 `_apply_hover(0.0)` 跑在 `setEditable` **之前** ——
+        #   不在这里补一次，可编辑的那些会一直顶着"非可编辑"的 30px 白留白。
+        self._apply_hover(self._hover)
 
     def _dropdown_rect(self) -> QRect:
         s = self._DROPDOWN_SIZE
@@ -932,7 +961,7 @@ class PresetViewDialog(_CardDialog):
 # ★三张卡片都继承 `_CardDialog`，走 design.md 4.5 那条共用皮肤
 #   （圆角 16px / 标题 15px Bold #0C447C / 正文 13px #334155 / 底部按钮右对齐 88×34）。
 # ★★**判据一个字都不在这里** —— 全在 `app/health.py`（三处 UI 用同一份结论，
-#   各写各的迟早漂移成「自检说没问题、状态条说没配 key」）。这里只负责**呈现**。
+#   各写各的迟早漂移成「自检说没问题、提示区说没配 key」）。这里只负责**呈现**。
 # ★`level` 三档的配色**只用 design.md §1 已有的三个语义色**（不新增颜色）：
 #     ok   → 成功绿 #1E8E3E
 #     warn → 主蓝  #378ADD   （「你可能是故意的」，是信息不是错误）
@@ -2295,26 +2324,317 @@ class _MessagePanel:
         _animate_message(self._msg_label, text, color)
 
 
+class ApiHelpDialog(_CardDialog):
+    """「管理 API」标题旁那个 **?** 的说明卡（2026-10-02 用户点一）。
+
+    - 宽 360（design.md 4.5 的常规档）。
+    - ★那个链接**必须真能点开**：`QLabel` 富文本 + `linkActivated` → `QDesktopServices.openUrl`。
+      **别用 `setOpenExternalLinks(True)`** 就完事 —— 显式连接这一条在 offscreen / 无浏览器
+      环境下也不会乱开窗，而且与 `UpdateDialog._open_page` 是同一个写法（一处先例）。
+      更**别把链接做成一段死文本** —— 点不开就等于没给路子（用户点名要的就是"可点击打开"）。
+    """
+
+    CARD_W = 360
+    HELP_URL = "https://platform.deepseek.com/"
+    # ★高度按正文实际行数自己算（用户口径「弹窗高度需要与文本适配，现在有大量多余空白」）。
+    #   各段与卡片布局里那几行一一对应（PAD_LR 是 card 布局的左右边距 ⇒ 正文可用宽）。
+    PAD_T, PAD_B, PAD_LR, GAP = 24, 20, 24, 12
+    BORDER = 1          # `_CARD_FRAME_QSS` 的 `border:1px solid` —— 它也会吃掉内容宽
+    BTN_W, BTN_H = 88, 34
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedWidth(self.CARD_W)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        card = QFrame()
+        card.setObjectName("confirmCard")
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(24, 24, 24, 20)
+        cl.setSpacing(12)
+
+        # ★2026-10-02 用户点：**这张卡没有标题**（原来是「API Key 从哪里来？」），
+        #   一句话说明 + 链接 + 回执就够了 —— 弹窗本来就是点标题旁那个 ? 出来的，
+        #   再顶一行大标题纯属重复。
+        body = QLabel(self._body_html())
+        body.setWordWrap(True)
+        body.setTextFormat(Qt.RichText)
+        body.setOpenExternalLinks(False)      # 交给下面那条显式连接去开
+        body.linkActivated.connect(self._open_link)
+        pol = body.sizePolicy()
+        pol.setHorizontalPolicy(QSizePolicy.Ignored)   # 别顶宽卡片（`_SettingRow` 的教训）
+        body.setSizePolicy(pol)
+        body.setStyleSheet("color:#334155; font-size:13px; background:transparent;")
+        cl.addWidget(body)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        btn_row.addStretch(1)
+        ok = QPushButton("知道了")
+        ok.setObjectName("confirmBtn")
+        ok.setCursor(Qt.PointingHandCursor)
+        ok.setFixedSize(self.BTN_W, self.BTN_H)
+        ok.clicked.connect(self.accept)
+        btn_row.addWidget(ok)
+        cl.addLayout(btn_row)
+
+        outer.addWidget(card)
+        self.setStyleSheet(_CARD_FRAME_QSS + _CARD_BTN_QSS)
+
+        # ★★高度必须**自己按正文实际高度钉死**，不能让 Qt 自己 `adjustSize()`：
+        #   正文那行是 `wordWrap` + 横向 `Ignored` 的 QLabel，布局在**还不知道最终宽度**
+        #   的时候算出来的 sizeHint 是按最窄宽度（138px）算的 —— 实测 sizeHint = 138×257，
+        #   而卡片宽 360 时正文其实只要 **60px**（3 行）⇒ 卡片高出一倍，多出来的空间
+        #   还被布局**塞给了正文那行**（实测正文被拉到 165px：上边 25、下边 190）。
+        #   `heightForWidth(内容宽)` 拿到的才是真实高度（实测 60），照它算卡片高。
+        self.setFixedSize(self.CARD_W, self._card_height(body))
+
+    @classmethod
+    def _content_w(cls) -> int:
+        """正文那行的**真实可用宽度**（`heightForWidth` 要用它）。
+
+        = 卡片宽 - 左右内边距 - 左右边框。★那个 `1px` 边框最容易漏：卡片带
+        `border:1px solid`，Qt 会按 frameWidth 再收一圈，正文实际只有 310px ——
+        拿 312 去算会多出 2px 余量（正文宽 310 却按 312 算高），差是差不出人命的，
+        但「正文高度 == heightForWidth(正文宽)」这条断言就再也立不住了。
+        """
+        return cls.CARD_W - cls.PAD_LR * 2 - cls.BORDER * 2
+
+    @classmethod
+    def _card_height(cls, body) -> int:
+        """由正文的实际换行高度推出卡片高度（**别再改成 sizeHint/adjustSize**，理由见 `__init__`）。
+
+        `heightForWidth` 拿不到（<=0）时才退回 `sizeHint` —— 那条路是坏的，但至少不会崩。
+        """
+        h = int(body.heightForWidth(cls._content_w()))
+        if h <= 0:
+            h = int(body.sizeHint().height())
+        return cls.PAD_T + h + cls.GAP + cls.BTN_H + cls.PAD_B
+
+    @classmethod
+    def _body_html(cls) -> str:
+        """正文（富文本）：★链接地址只写一次 —— 从 `HELP_URL` 生成，别在正文里再抄一遍。
+
+        ★2026-10-02 用户点：正文逐字给定 ⇒ **原样照抄，不许顺手润色**
+          （`Key需要` 中间没有空格、`Deepseek` 就是这么拼的，都是用户口径）。
+        """
+        return (
+            "API Key需要从各模型的开放平台获取。<br>"
+            "例如Deepseek：<a href=\"%s\" style=\"color:#378ADD;\">%s</a><br>"
+            "获取后返回该界面，自行添加即可。"
+            % (cls.HELP_URL, cls.HELP_URL)
+        )
+
+    def _open_link(self, url: str):
+        """★真的去开浏览器（`_dialog_start_url` 会做一次兜底解析，见 gui.py 里那个 helper）。"""
+        QDesktopServices.openUrl(QUrl(str(url or self.HELP_URL)))
+
+    @staticmethod
+    def show_help(parent=None):
+        dlg = ApiHelpDialog(parent)
+        dlg.exec()
+        return dlg
+
+
+class ModelSetupDialog(_CardDialog):
+    """**首启的语音模型选择卡**（2026-10-02 用户点六）。
+
+    用户视角的问题：第一次下载、第一次打开，软件「什么都不说」—— 而它其实**不是残废**，
+    只是默认不出声（没装 3.6 GB 的音色克隆模型）。与其让人以为坏了，不如**当面问一句**。
+
+    - 宽 400（比常规档略宽：正文有四行，360 会挤成一条窄柱）。
+    - 「先不安装」= 取消语义（`reject`）；「立即安装」= primary（`accept`）。
+    - ★★**非阻塞**（`open()` 而不是 `exec()`）—— 与 `FirstRunDialog.show_guide` 同一条铁律：
+      `main()` 末尾会调它，`exec()` 会在这里嵌一个模态事件循环 ⇒ `main()` 回不去、
+      那四个「真跑一次 main()」的探针当场挂到硬超时。
+    """
+
+    CARD_W = 400
+    BTN_W, BTN_H = 96, 34
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedWidth(self.CARD_W)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        card = QFrame()
+        card.setObjectName("confirmCard")
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(24, 24, 24, 20)
+        cl.setSpacing(12)
+
+        title = QLabel("要让她开口说话吗？（可选）")
+        title.setWordWrap(True)
+        title.setStyleSheet(
+            "font-size:15px; font-weight:bold; color:#0C447C; background:transparent;"
+        )
+        cl.addWidget(title)
+
+        # ★文案口径（用户点六）：把「不装也能用」摆最前面，再把代价说清，最后给出退路。
+        lines = [
+            "不装也能用 —— 文字聊天、打开软件、查资料都不受影响。",
+            "想让她真的出声，需要额外下载约 3.6 GB 的音色克隆模型；",
+            "合成语音会让每条回复多等一会儿。",
+            "之后也能在「设置 → 通用设置 → 语音模型」里随时下载。",
+        ]
+        for i, text in enumerate(lines):
+            lbl = QLabel(("<span style='color:#64748B;'>★　</span>" if i == 3 else "") + text)
+            lbl.setWordWrap(True)
+            lbl.setTextFormat(Qt.RichText)
+            pol = lbl.sizePolicy()
+            pol.setHorizontalPolicy(QSizePolicy.Ignored)
+            lbl.setSizePolicy(pol)
+            lbl.setStyleSheet("color:#334155; font-size:13px; background:transparent;")
+            cl.addWidget(lbl)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        btn_row.addStretch(1)
+        skip = QPushButton("先不安装")
+        skip.setObjectName("cancelBtn")
+        skip.setCursor(Qt.PointingHandCursor)
+        skip.setFixedSize(self.BTN_W, self.BTN_H)
+        skip.clicked.connect(self.reject)
+        btn_row.addWidget(skip)
+        install = QPushButton("立即安装")
+        install.setObjectName("confirmBtn")
+        install.setCursor(Qt.PointingHandCursor)
+        install.setFixedSize(self.BTN_W, self.BTN_H)
+        install.clicked.connect(self.accept)
+        btn_row.addWidget(install)
+        cl.addLayout(btn_row)
+
+        outer.addWidget(card)
+        self.setStyleSheet(_CARD_FRAME_QSS + _CARD_BTN_QSS)
+
+    @staticmethod
+    def show_setup(parent, on_install=None):
+        """弹一次「要不要装模型」。**非阻塞**（见类文档）。
+
+        `on_install`：点了「立即安装」之后要干嘛（`main.py` 接的是
+        「开始下载 + 跳到通用设置页」）。返回值是那个弹窗对象 —— **不阻塞**，
+        所以拿不到「点了哪个按钮」的同步结果，要结果就用 `on_install`。
+        """
+        dlg = ModelSetupDialog(parent)
+        if on_install is not None:
+            dlg.finished.connect(lambda code: on_install() if code == QDialog.Accepted else None)
+        dlg.open()
+        return dlg
+
+
 class ApiPanel(_MessagePanel, QWidget):
-    """嵌入右侧的 API 管理面板：当前 API 选择 + 列表 + 添加。"""
+    """嵌入右侧的 API 管理面板：当前角色的当前 API + 列表 + 添加。
+
+    ★★2026-10-02（用户口径「每个角色用独立的列表，可以用同个 key，但命名是分开显示的」）：
+      数据层 API 是**每个角色一份完全独立的列表**（`cfg["apis"][role]` /
+      `cfg["current_api"][role]`），同一个 key 在两个角色下各录一次、名字各起各的，
+      删一边不影响另一边 —— **这条没变**。
+    ★★2026-10-02 用户点二：面板上的**「配置哪个角色」那一行删掉了** —— 用户不要
+      在这个页面上切角色。`_role_key` 因此固定在「进来时的当前角色」
+      （`cfg["current_role"]`，`__init__` 里定），本页所有操作只碰它的那一份。
+    ★「管理 API」标题旁那个 **?** 是用户点一要求的说明入口（圆圈框住问号）。
+    ★**整页可滚**（用户点三）：`_scroll` 把标题 / 卡片 / 按钮 / 列表 / 提示**全包**进去 ——
+      原来只有「已有 API」那段是滚动区，悬在半截中间的滚动条很怪。
+    """
+
+    HELP_D = 16          # ? 按钮直径（≈ 标题 16px 字号的**三分之二**，用户口径）
+    TITLE_PX = 16        # 标题字号（上面那句"三分之二"是相对它算的）
 
     def __init__(self, cfg, parent=None):
         super().__init__(parent)
         self.cfg = cfg
         self._key_visible = False
+        # ★本页操作哪个角色：**固定**取进面板时的当前角色（顶层那行「配置哪个角色」
+        #   已按用户口径删掉，页面内不再切角色）；取不到就落到角色清单第一位。
+        self._role_key = str(cfg.get("current_role") or (role_keys(cfg)[0]))
+        if self._role_key not in role_keys(cfg):
+            self._role_key = role_keys(cfg)[0]
         self._build()
         self._apply_style()
         self.refresh()
 
+    # ---- 数据 ----
+    def _role_apis(self) -> list:
+        """**正在编辑的那个角色**的列表 —— 就地建好并返回（返回临时 list 会改了个寂寞）。
+
+        ★必须返回 cfg 里那个**真的列表对象**：下面所有增删都是就地改它 / 换它，
+          而不是改一个副本（改副本 = 界面上看着成了、落盘却没变，最阴的一种）。
+        """
+        apis = self.cfg.get("apis")
+        if not isinstance(apis, dict):
+            apis = {}
+            self.cfg["apis"] = apis
+        lst = apis.get(self._role_key)
+        if not isinstance(lst, list):
+            lst = []
+            apis[self._role_key] = lst
+        return lst
+
+    def _role_display(self, role_key: str) -> str:
+        roles = self.cfg.get("roles")
+        name = ""
+        if isinstance(roles, dict) and isinstance(roles.get(role_key), dict):
+            name = str(roles[role_key].get("name") or "").strip()
+        return name or str(role_key)
+
     def _build(self):
-        lay = QVBoxLayout(self)
+        # ★整页滚动（2026-10-02 用户点三）：内容超出窗口高度时**整页**滑动。
+        #   原来只有「已有 API」那一段是 QScrollArea ⇒ 滚动条悬在页面中间、上半截永远滑不动。
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet("QScrollArea { background:transparent; border:none; }")
+        self._scroll.setVerticalScrollBar(_SmoothScrollBar())
+        # ★这一层是「整页」的容器：下面每一块都挂到它的 lay 上，最后整体交给滚动区。
+        # ★★2026-10-02（用户报「当前 API 那一条底色不统一」+ 主按钮看不见了）：这一层
+        #   **故意不设** `setStyleSheet("background:transparent;")`。
+        #   Qt 的规矩是「样式表设在某个控件上 ⇒ 对它**自己**、以及它的**全部子孙**生效」，
+        #   所以那句 transparent 会把整棵子树里的 `background` 全压成透明：
+        #   卡片 `QFrame#card{#F6FAFF}` 变白、主按钮 `QPushButton{#378ADD}` 成了
+        #   「白底 + 白字」（**整个按钮看不见**，而它不报错、结构断言也照样绿）。
+        #   offscreen 抓像素实测：卡片 #FFFFFF / 按钮 #FFFFFF；**只把这一句删掉** ⇒
+        #   卡片 #F6FAFF、按钮 #378ADD。而「重设面板样式」/「把这句挪到最后」/
+        #   「改写成 `QWidget{background:transparent}`」**都无效** —— 唯一的解就是不在这里设样式。
+        #   ⇒ 页面底色由滚动区视口兜住（白），本来也不需要这句。**别再加回来。**
+        page = QWidget()
+        lay = QVBoxLayout(page)
         lay.setContentsMargins(24, 20, 24, 20)
         lay.setSpacing(14)
 
-        # 标题
+        # 标题 + 问号说明（2026-10-02 用户点一：圆圈框住问号，点开是"API 从哪来"）
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(6)
         title = QLabel("管理 API")
-        title.setStyleSheet("font-size:16px; font-weight:bold; color:#0C447C; background:transparent;")
-        lay.addWidget(title)
+        title.setStyleSheet(
+            "font-size:%dpx; font-weight:bold; color:#0C447C; background:transparent;"
+            % self.TITLE_PX
+        )
+        title_row.addWidget(title, 0, Qt.AlignVCenter)
+        self.help_btn = QPushButton("?")
+        self.help_btn.setCursor(Qt.PointingHandCursor)
+        self.help_btn.setFixedSize(self.HELP_D, self.HELP_D)
+        self.help_btn.setToolTip("API Key需要从各模型的开放平台获取。")
+        self.help_btn.setStyleSheet(
+            "QPushButton{background:transparent; color:#378ADD; border:1px solid #378ADD;"
+            " border-radius:%dpx; font-size:11px; font-weight:bold; padding:0;}"
+            "QPushButton:hover{background:#E6F1FB;}"
+            % (self.HELP_D // 2)
+        )
+        self.help_btn.clicked.connect(self._show_help)
+        title_row.addWidget(self.help_btn, 0, Qt.AlignVCenter)
+        title_row.addStretch(1)
+        lay.addLayout(title_row)
 
         # 卡片：当前 API
         current_card = QFrame()
@@ -2322,7 +2642,18 @@ class ApiPanel(_MessagePanel, QWidget):
         cl = QVBoxLayout(current_card)
         cl.setContentsMargins(16, 14, 16, 14)
         cl.setSpacing(10)
-        cl.addWidget(QLabel("当前 API"))
+        # ★文案：2026-10-02 用户口径「管理 API 下的『当前使用的 API』文本改为『当前 API』」。
+        #   （★「管理 API / 已有 API」都是这个写法，所以这里也留一个空格。）
+        self._cur_head = QLabel("当前 API")
+        # ★★背景**必须显式透明**：面板级样式里有 `QWidget { background:#FFFFFF; }`，
+        #   它会命中卡片里的每一个 QLabel ⇒ 这一行会渲染成一条**白带**。
+        #   透明 = 露出卡片的底色。
+        #   ★卡片底色 = `#F6FAFF` —— 也就是用户口径里的 **H213S4B100**
+        #     （HSB 213/4%/100%，即 design.md §1 那个「输入框淡蓝」，**没有新增颜色**）。
+        #     ⚠️卡片那条 `QFrame#card` 规则只有在**不给 `page` 设样式表**时才生效，
+        #       见 `_build()` 开头的长注释（这条踩过，别再退回白底）。
+        self._cur_head.setStyleSheet("background:transparent;")
+        cl.addWidget(self._cur_head)
         self.api_combo = HoverComboBox()
         self.api_combo.currentIndexChanged.connect(self._on_api_select)
         cl.addWidget(self.api_combo)
@@ -2349,28 +2680,28 @@ class ApiPanel(_MessagePanel, QWidget):
         lay.addLayout(btn_row)
 
         list_label = QLabel("已有 API")
-        list_label.setStyleSheet("font-weight:bold; color:#334155;")
+        list_label.setStyleSheet("font-weight:bold; color:#334155; background:transparent;")
         lay.addWidget(list_label)
 
-        # 滚动区：只有这里滚动，多出的 API 行通过滚轮下滑查看，上滑内容被 list_label 遮挡
-        self._scroll = QScrollArea()
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setFrameShape(QFrame.NoFrame)
-        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._scroll.setStyleSheet("QScrollArea { background:transparent; border:none; }")
-        self._scroll.setVerticalScrollBar(_SmoothScrollBar())
+        # ★列表**不再是**自己的滚动区了：整页那一个滚动区说了算（见方法开头）。
+        #   这里只要一个纯容器，按行数自然长高 ⇒ 撑出整页的滚动区间。
         self._list_container = QWidget()
         self._list_container.setStyleSheet("background:transparent;")
         self._list_lay = QVBoxLayout(self._list_container)
         self._list_lay.setContentsMargins(0, 0, 8, 0)
         self._list_lay.setSpacing(8)
-        self._scroll.setWidget(self._list_container)
-        lay.addWidget(self._scroll, 1)
+        lay.addWidget(self._list_container)
 
-        # 消息标签移到底部，避免撑开"添加 API 按钮"与"已有 API"之间的间距
+        # 消息标签排在列表之后（内容短时用末尾 stretch 顶住，不会浮在半空）
         self._msg_label = QLabel("")
         self._msg_label.setWordWrap(True)
         lay.addWidget(self._msg_label)
+
+        # 末尾 stretch：内容不够高时把上面几块顶在顶部，而不是被均分拉散
+        lay.addStretch(1)
+
+        self._scroll.setWidget(page)
+        outer.addWidget(self._scroll, 1)
 
     def _apply_style(self):
         self.setStyleSheet(
@@ -2388,21 +2719,21 @@ class ApiPanel(_MessagePanel, QWidget):
     def refresh(self):
         self.api_combo.blockSignals(True)
         self.api_combo.clear()
-        names = [a.get("name") for a in self.cfg.get("apis", [])]
+        names = [a.get("name") for a in self._role_apis()]
         self.api_combo.addItems(names)
-        cur = self.cfg.get("current_api")
+        cur = current_api_name(self.cfg, self._role_key)
         if cur in names:
             self.api_combo.setCurrentIndex(names.index(cur))
         self.api_combo.blockSignals(False)
         self._refresh_api_info()
         self._rebuild_list()
 
+    def _show_help(self):
+        """标题旁那个 **?**：弹「API Key 从哪来」的说明卡（里面的链接可点开）。"""
+        ApiHelpDialog.show_help(self)
+
     def _current_entry(self):
-        name = self.cfg.get("current_api")
-        for a in self.cfg.get("apis", []):
-            if a.get("name") == name:
-                return a
-        return None
+        return get_current_api(self.cfg, self._role_key)
 
     def _refresh_api_info(self):
         entry = self._current_entry()
@@ -2421,7 +2752,7 @@ class ApiPanel(_MessagePanel, QWidget):
         self.api_info_label.setText(f"key：{shown}")
 
     def _on_api_select(self):
-        self.cfg["current_api"] = self.api_combo.currentText()
+        set_current_api(self.cfg, self.api_combo.currentText(), self._role_key)
         self._key_visible = False
         save_config(self.cfg)
         self._refresh_api_info()
@@ -2432,14 +2763,19 @@ class ApiPanel(_MessagePanel, QWidget):
         self._refresh_api_info()
 
     def _add_api(self):
-        existing = [a.get("name") for a in self.cfg.get("apis", [])]
+        existing = [a.get("name") for a in self._role_apis()]
         dlg = ApiFormDialog(
             "添加 API",
             [
                 ("name", "AI 名称：", "例如：爱丽丝", "", False),
                 ("api_key", "API Key：", "sk-...", "", True),
-                ("base_url", "接口地址：", DEFAULT_BASE_URL, DEFAULT_BASE_URL, False),
-                ("model", "模型名：", DEFAULT_MODEL, DEFAULT_MODEL, False),
+                # ★第 6 项 = 下拉候选项（2026-10-02 用户点：这两项改成下拉选择，方便些）。
+                #   地址项的元素是 `(显示文本, 纯地址)` 二元组 —— 纯地址挂 userData，
+                #   `get()` 优先取它（否则会把「DeepSeek · https://…」整串存进 config）。
+                #   模型项的候选项**交给联动按地址填**（空 list = 待补），别在这儿写死 ——
+                #   写死了「编辑一条方舟条目」时就会错配成 DeepSeek 的模型。
+                ("base_url", "接口地址：", "", DEFAULT_BASE_URL, False, providers.address_items()),
+                ("model", "模型名：", "", DEFAULT_MODEL, False, []),
             ],
             self,
         )
@@ -2451,20 +2787,29 @@ class ApiPanel(_MessagePanel, QWidget):
         if not name or not key:
             self._msg("名称与 API Key 不能为空。", error=True)
             return
+        # ★重名只在**这个角色**的列表里查：同一个 key/名字在另一个角色下可以再录一份
+        #   （用户口径「命名是分开显示的」——两边本来就该能各起各的名字）。
         if name in existing:
-            self._msg(f"名称「{name}」已存在，请换一个。", error=True)
+            self._msg(f"名称「{name}」在「{self._role_display(self._role_key)}」下已存在，请换一个。",
+                      error=True)
             return
-        self.cfg.setdefault("apis", []).append({
+        self._role_apis().append({
             "name": name,
             "api_key": key,
-            "base_url": dlg.get("base_url") or DEFAULT_BASE_URL,
+            # ★再过一道 `base_url_of`（**双保险**）：`get()` 是按**文本**反查候选项拿
+            #   userData 的，可用户要是**手改了**那一行（比如在
+            #   「DeepSeek · https://api.deepseek.com」后头补了个 `/v1`），文本就匹配不上
+            #   任何候选项 ⇒ `get()` 只能原样吐回那串**带「名 · 」前缀**的文本 ⇒ 存进
+            #   config 后 `ai.py` 拿它拼 URL ⇒ **请求全挂**（而且不报错）。这里再剥一层。
+            "base_url": providers.base_url_of(dlg.get("base_url")) or DEFAULT_BASE_URL,
             "model": dlg.get("model") or DEFAULT_MODEL,
         })
-        # 新添加的即成为当前 API；同一时刻只有一个 API 生效，其余自动停用
-        self.cfg["current_api"] = name
+        # 新添加的即成为**该角色**的当前 API（只影响这一个角色，另一个纹丝不动）
+        set_current_api(self.cfg, name, self._role_key)
         save_config(self.cfg)
         self.refresh()
-        self._msg(f"已添加「{name}」并切换为当前 API。", error=False)
+        self._msg(f"已为「{self._role_display(self._role_key)}」添加「{name}」并切换为当前 API。",
+                  error=False)
 
     def _rebuild_list(self):
         # 记录当前展开的 API 名称，重建后恢复展开状态（编辑等操作不收起）
@@ -2480,7 +2825,7 @@ class ApiPanel(_MessagePanel, QWidget):
             if w is not None:
                 w.setParent(None)
                 w.deleteLater()
-        apis = self.cfg.get("apis", [])
+        apis = self._role_apis()
         if not apis:
             empty = QLabel("暂无 API，点击上方「添加 API」开始。")
             empty.setStyleSheet("color:#64748B; padding:10px;")
@@ -2504,14 +2849,17 @@ class ApiPanel(_MessagePanel, QWidget):
     def _edit_row(self, entry, row_frame):
         # 编辑 API：名称 / 接口地址 / 模型名（API Key 保持不变，避免误改）
         old_name = entry.get("name")
+        # ★地址初值给**纯地址**就行：`ApiFormDialog._select_initial` 会先按显示文本、
+        #   再按候选项的 userData（就是纯地址）去找 —— 找到就高亮到那一家、并显示成
+        #   「服务商名 · 地址」；不在表里（自定义地址）⇒ 原样显示原文。
+        _url0 = entry.get("base_url") or DEFAULT_BASE_URL
         dlg = ApiFormDialog(
             "编辑 API",
             [
                 ("name", "AI 名称：", "例如：爱丽丝", old_name or "", False),
-                ("base_url", "接口地址：", DEFAULT_BASE_URL,
-                 entry.get("base_url") or DEFAULT_BASE_URL, False),
-                ("model", "模型名：", DEFAULT_MODEL,
-                 entry.get("model") or DEFAULT_MODEL, False),
+                ("base_url", "接口地址：", "", _url0, False, providers.address_items()),
+                # 模型初值 = 条目里存的原值（自定义过的模型名靠 `preserve_unknown` 留住）
+                ("model", "模型名：", "", entry.get("model") or DEFAULT_MODEL, False, []),
             ],
             self,
         )
@@ -2522,27 +2870,33 @@ class ApiPanel(_MessagePanel, QWidget):
         if not new_name:
             self._msg("名称不能为空。", error=True)
             return
-        # 重名校验（排除自己）
-        others = [a.get("name") for a in self.cfg.get("apis", []) if a is not entry]
+        # 重名校验（排除自己；★只在**这个角色**的列表里查）
+        others = [a.get("name") for a in self._role_apis() if a is not entry]
         if new_name in others:
-            self._msg(f"名称「{new_name}」已存在。", error=True)
+            self._msg(f"名称「{new_name}」在「{self._role_display(self._role_key)}」下已存在。",
+                      error=True)
             return
         entry["name"] = new_name
-        entry["base_url"] = dlg.get("base_url") or DEFAULT_BASE_URL
+        # ★双保险，理由同 `_add_api`（用户手改那一行 ⇒ 文本匹配不上候选项 ⇒ 会漏出前缀）
+        entry["base_url"] = providers.base_url_of(dlg.get("base_url")) or DEFAULT_BASE_URL
         entry["model"] = dlg.get("model") or DEFAULT_MODEL
-        if self.cfg.get("current_api") == old_name:
-            self.cfg["current_api"] = new_name
+        if current_api_name(self.cfg, self._role_key) == old_name:
+            set_current_api(self.cfg, new_name, self._role_key)
         save_config(self.cfg)
         self.refresh()
         self._msg(f"已保存「{new_name}」。", error=False)
 
     def _delete(self, entry):
-        """执行删除（确认框已由 _confirm_delete 弹过，这里不再重复确认）。"""
+        """执行删除（确认框已由 _confirm_delete 弹过，这里不再重复确认）。
+
+        ★只从**这个角色**的列表里摘掉它 —— 同一个 key 挂在另一个角色下时，
+          那边的那一份**原样保留**（这正是「独立列表」的意义）。
+        """
         name = entry.get("name")
-        self.cfg["apis"] = [a for a in self.cfg.get("apis", []) if a is not entry]
-        if self.cfg.get("current_api") == name:
-            remaining = self.cfg.get("apis", [])
-            self.cfg["current_api"] = remaining[0]["name"] if remaining else ""
+        remaining = [a for a in self._role_apis() if a is not entry]
+        self.cfg["apis"][self._role_key] = remaining
+        if current_api_name(self.cfg, self._role_key) == name:
+            set_current_api(self.cfg, remaining[0]["name"] if remaining else "", self._role_key)
         save_config(self.cfg)
         self.refresh()
         self._msg(f"已删除「{name}」。", error=False)
@@ -5212,7 +5566,7 @@ class GeneralPanel(_MessagePanel, QWidget):
         # 不经过这里 —— 两条路各弹各的、不会重叠。
         if self._win is not None:
             self._win.notify_mute_mode(on)
-        self._refresh_health(False)     # P2：静音开关也影响「顶上那条常显状态条」
+        self._refresh_health(False)     # 静音开关也影响顶上那条「静音模式」提示
         self._msg("已开启静音模式：回复只输出中文，不再合成语音（已记住，重启后仍是开启）。"
                   if on else "已关闭静音模式：恢复日语语音。（已记住，重启后仍是关闭）")
 
@@ -5290,10 +5644,10 @@ class GeneralPanel(_MessagePanel, QWidget):
     # ---- 帮助（P2：使用引导 / 一键自检 / 检查更新，2026-10-02）----
 
     def _refresh_health(self, recompute=False):
-        """设置页改了东西之后，顺手把顶上那条**常显状态条**重算一次（P2）。
+        """设置页改了东西之后，顺手把顶上那条提示重算一次（2026-10-02）。
 
-        ★必须做：状态条讲的与这一页改的是**同一件事**（静音 / 模型 / 白名单），
-          一个变了另一个还写着旧的，比不显示更误导。
+        ★必须做：提示区讲的与这一页改的是**同一件事**（白名单 —— 静音 / 模型那两条
+          是"启动时一次性"的，不跟这里走），一个变了另一个还写着旧的，比不显示更误导。
         ★`recompute=True` 只在**真的可能改变外部事实**的地方用（换安装位置 / 下载完成 /
           卸载）—— 它会去 stat 模型目录；滑块回调那种场景只重跑 cfg 判据就够。
         """
@@ -5455,42 +5809,50 @@ class GeneralPanel(_MessagePanel, QWidget):
             self.set_model_dir(chosen)
 
     def _download_model(self):
-        """「下载」：**下载中这颗按钮是「取消」**，所以先分流；否则**先确认**、再启动真下载
-        （`docs/02` §22.6.6 / §22.6.7）。
+        """「下载」那颗按钮的回调：交给 `start_download()`（确认框是它的事）。
 
         ★顺序（用户口径 2026-09-27「点击确认后才正式开始下载」）：
           **分流取消 → 弹确认框 → 磁盘预检 → 起线程**。确认框是**第一道**，预检在 `start()`
           内部（同步、只看 stat）：先问再预检，预检不过就等确认之后立刻报错。
         ★确认框只拦「真正要开始下载」这一支 —— 下载中那颗按钮已经是「取消」，**不许弹**
-          （否则点「取消」反被问「是否下载？」，听起来像要再下一次）。
-        ★确认框文案**由 `voice_download.confirm_message(is_full)` 生成**，不是写死的常量串：
-          全量时**三行**（中间那行报「共约 3.6 GB」），只下模型时**两行**。
-          ★「要不要全量」用的是**流水线实际跳不跳段的同一个判据**（`is_full_install`），
+          （否则点「取消」反被问「是否下载？」，听起来像要再下一次）。⇒ 分流写在 `start_download` 里。
+        """
+        self.start_download()
+
+    def start_download(self, confirm: bool = True) -> bool:
+        """真正开始下载（**首启那张卡也走它**，2026-10-02）。返回是否真的起了下载。
+
+        ★`confirm=False`：跳过「确认下载？」弹窗。**只有首启卡用它** —— 用户刚在那边按过
+          「立即安装」，再问一遍是多余的一道门。
+        ★文案与判据仍全在 `voice_download` / `voice_model` 里（见下面被搬走的原注释）：
+          - 确认框文案由 `voice_download.confirm_message(is_full)` 生成，不是写死的常量串；
+            「要不要全量」用的是**流水线实际跳不跳段的同一个判据**（`is_full_install`），
             不许在这里另算一套 —— 两套判据迟早漂移，弹窗就会对用户说假话。
-        ★磁盘预检在 `voice_download.start()` 里**同步**做完（只看 stat，毫秒级）：不足就
-          **根本不启动**并直接说要多少 —— 别让人等十分钟才失败。
-        ★装到 `voice_model.install_root(self.cfg)`（**安装根 = 唯一真值**）：用户指定目录 →
-          本机已有安装（项目内 → `D:\\GPT-SoVITS`）→ 全新装到项目内。**不再用
-          `default_install_dir()`** —— 那条不含历史路径，会出现「`D:\\GPT-SoVITS` 明明能用、
-          点下载却在项目内又造一套」。
+          - 磁盘预检在 `voice_download.start()` 里**同步**做完（只看 stat，毫秒级）：不足就
+            **根本不启动**并直接说要多少 —— 别让人等十分钟才失败。
+          - 装到 `voice_model.install_root(self.cfg)`（**安装根 = 唯一真值**）：用户指定目录 →
+            本机已有安装（项目内 → `D:\\GPT-SoVITS`）→ 全新装到项目内。**不再用
+            `default_install_dir()`** —— 那条不含历史路径，会出现「`D:\\GPT-SoVITS` 明明能用、
+            点下载却在项目内又造一套」。
         """
         if voice_download.is_running():
             self._cancel_download()
-            return
+            return False
         root = voice_model.install_root(self.cfg)
-        if not ConfirmDialog.confirm(
+        if confirm and not ConfirmDialog.confirm(
             self,
             voice_download.confirm_message(voice_download.is_full_install(self.cfg, root)),
             confirm_text="确认", cancel_text="取消",
         ):
-            return
+            return False
         ok, msg = voice_download.start(self.cfg, root=root)
         if not ok:
             self._msg(msg, error=True)
-            return
+            return False
         self._dl_timer.start()
         self._apply_download_state(voice_download.snapshot())
         self._msg("%s已开始下载到 %s。" % (msg, root), error=False)
+        return True
 
     def _uninstall_model(self):
         """「卸载」：**三选一**弹窗 → `仅模型卸载` / `全部卸载`（送回收站）→ 回「未下载」态并锁死静音。
@@ -5755,17 +6117,37 @@ class ChatView(QWidget):
         self._append_row(self._wrap(row))
         return bubble
 
-    def add_system(self, text: str):
+    def add_system(self, text: str, link_text: str = "", on_link=None):
+        """居中灰字系统消息。
+
+        `link_text` + `on_link`（2026-10-02 新增，用户点三）：把正文里**第一次出现**的
+        `link_text` 渲染成一条可点的下划线链接 —— 权限被拒时那条「…去添加」就是它。
+        ★**只有传了这两个参数才会有链接**：其余调用点（唤醒提示 / 已执行提示…）走的是
+          与以前逐字相同的纯文本路径，样式一个像素都不变。
+        ★★别让正文自己带 HTML：`text` / `link_text` 都过 `html.escape`，否则用户可控的
+          目录名里一个 `<` 就能把这条消息渲染乱（QLabel 认富文本）。
+        """
         row = QHBoxLayout()
-        lbl = QLabel(text)
+        body = html.escape(str(text))
+        has_link = bool(link_text) and on_link is not None
+        lbl = QLabel()
+        if has_link:
+            link = html.escape(str(link_text))
+            body += ('<a href="#go" style="color:#378ADD; text-decoration:underline;">%s</a>'
+                     % link)
         # ★**必须换行**（`_hint_tip` 那条坑的同款）：系统消息不换行时，QLabel 的
         #   `minimumSizeHint` = 整段文字的**单行宽**，会把滚动区 `_container` 的**最小宽**
         #   顶到视口之外；而滚动区是 `widgetResizable=True` + 水平滚动条关闭 → 内容比视口宽
         #   就直接被裁右边，且**加过就不会自己恢复**。靠右的**用户气泡**首当其冲：
         #   右端被裁掉，看起来像「向右偏移、只剩左半截」。
+        lbl.setText(body)
+        lbl.setTextFormat(Qt.RichText if has_link else Qt.PlainText)
         lbl.setWordWrap(True)
         lbl.setStyleSheet("color:#64748B; font-size:12px; padding:6px;")
         lbl.setAlignment(Qt.AlignCenter)
+        if has_link:
+            lbl.setOpenExternalLinks(False)      # 交给下面那条回调，别去开浏览器
+            lbl.linkActivated.connect(lambda _=None: on_link())
         # ★水平策略设 `Ignored`：让它**不参与最小宽度诉求**（长文本也不能把内容区顶宽）。
         #   注意 `setWordWrap(True)` 会把策略重置成 (Preferred, Preferred, heightForWidth=True)，
         #   所以必须在它**之后**改，并且**只改水平轴**、保留 `heightForWidth` —— 否则换行后
@@ -5777,6 +6159,7 @@ class ChatView(QWidget):
         # 那样长文本只会拿到 1/3 行宽、被挤成一条窄柱。
         row.addWidget(lbl, 1)
         self._append_row(self._wrap(row))
+        return lbl
 
     def show_thinking(self, name: str, role_key: str = ""):
         """显示「头像 + 灰色气泡『xxx 正在思考...』」（AI 思考/合成期间）。"""
@@ -5866,10 +6249,65 @@ class ChatView(QWidget):
 
 # ========== API 表单对话框（添加 / 编辑共用，可配接口地址与模型名） ==========
 
+def _park_cursor(combo) -> None:
+    """把下拉编辑框里的光标停到**最前面**。
+
+    ★为什么：编辑区（~254px）放不下长地址，光标停在**末尾**时 Qt 会滚动显示**尾部**，
+      开头那截「服务商名」就被整段切掉，看着像少了个字。停到 0 ⇒ 优先露出服务商名。
+    ★**只有可编辑的 combo 才有编辑框**（`lineEdit()` 对非可编辑的返回 `None`）——
+      这里必须判空，否则一旦有人把这个下拉改成"只能选"，`__init__` 里当场 `AttributeError`。
+    """
+    le = combo.lineEdit()
+    if le is not None:
+        le.setCursorPosition(0)
+
+
+def _select_initial(combo, text: str) -> None:
+    """把下拉的初值落到正确位置上（**只有下拉才用**，文本框不用）。
+
+    ★★必须先 `findText`、再 `findData`，**最后**才退回 `setCurrentText` —— 三个都不能省：
+
+    - **按文本找**：候选项就是 `(显示文本, userData)` 时，调用点手上往往是显示文本；
+    - **按 userData 找**：调用点手上也可能只有**纯值**（地址字段的 userData 就是纯地址，
+      例如 `DEFAULT_BASE_URL`）—— 少了这一路，"默认 DeepSeek"会显示成一串裸地址、
+      而且**不高亮到对应项**（拉下拉看不见当前选的是谁）；
+    - ★★**绝不能只靠 `setCurrentText`**：Qt 对**可编辑** combo 的 `setCurrentText()` 是
+      「只把文本塞进编辑框」，**不动 `currentIndex`** ⇒ 当前项不高亮、且 `currentData()`
+      还停在上一个选中项上（`get()` 若信它就会**存错地址**，见 `get()` 的注释）。
+    """
+    i = combo.findText(text)
+    if i < 0:
+        i = combo.findData(text)
+    if i >= 0:
+        combo.setCurrentIndex(i)      # ★这才真正把 index（= 高亮 + userData）挪过去
+    else:
+        combo.setCurrentText(text)    # editable：任意文本都显示得出来（自定义地址/模型）
+    # ★初值也一样把光标停到最前面（理由见 `_park_cursor`）
+    _park_cursor(combo)
+
+
 class ApiFormDialog(_CardDialog):
     """API 表单弹窗（添加 / 编辑共用）—— 与 `ConfirmDialog` / `InputDialog` 同一张卡片皮肤。
 
-    fields: [(attr, 标签, 占位提示, 初始值, 是否密码框)]
+    fields: `[(attr, 标签, 占位提示, 初始值, 是否密码框[, 候选项]), …]`
+      - 第 5 项 `is_password`：True ⇒ 密码框（只对文本框有效）。
+      - 第 6 项 `choices`（可省）：
+          * **不写 / None** ⇒ 普通文本框（`QLineEdit`）；
+          * **list**       ⇒ **可编辑下拉框**（`HoverComboBox` + `setEditable(True)`），
+                             元素可以是 `"文本"`，也可以是 `(显示文本, userData)` 二元组
+                             （userData 会被 `get()` 优先取用，见下）。
+                             ★空 list = 「候选项稍后由联动补」。
+
+    ★★两个下拉框都**可编辑**（2026-10-02 用户拍板「需要能通过下拉条选择，这样更方便
+      用户使用」，同批也确认了要**保留手输**）：豆包方舟的接入点 ID（`ep-xxxx`）、
+      第三方中转站、公司内网地址都还能手输 ⇒ 这个下拉**不是"只能选"**，别拿它当校验。
+      另外 `NoInsert` 必须设 —— 否则用户敲回车（= 确认）时，Qt 会把编辑框里的字**插进
+      候选项列表**，越用越脏（而且这个脏是**存不下来**的，下次开又没了，最难查）。
+
+    link: `(源字段, 目标字段)` —— 源（接口地址）一变，目标（模型名）的候选项跟着换。
+      ★只认「源文本能查到一家」的情形；**查不到（自定义地址）⇒ 目标原样不动**
+        （用户手填的模型名不能被清掉）。规则见 `app/providers.py::models_for`。
+
     判定用户是否点了「确认」用 `confirmed()`（`exec()` 返回 `Accepted`）。
 
     ⚠️ **不要退回 `QMessageBox`**（2026-09-17 用户报「不符合规范」）：它自带系统标题栏、
@@ -5880,7 +6318,7 @@ class ApiFormDialog(_CardDialog):
     # 与 ConfirmDialog / InputDialog 的按钮同尺寸
     BTN_SIZE = (88, 34)
 
-    def __init__(self, title, fields, parent=None):
+    def __init__(self, title, fields, parent=None, link=("base_url", "model")):
         super().__init__(parent)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -5898,21 +6336,57 @@ class ApiFormDialog(_CardDialog):
         title_lbl.setStyleSheet("font-size:15px; font-weight:bold; color:#0C447C; background:transparent;")
         card_lay.addWidget(title_lbl)
 
-        # 字段区：每个字段两行（标签 + 输入框），字段之间 12px
+        # 字段区：每个字段两行（标签 + 控件），字段之间 12px
         self.edits = {}
         fields_box = QVBoxLayout()
         fields_box.setSpacing(12)
-        for attr, label, placeholder, initial, is_password in fields:
+        for field in fields:
+            # ★按**下标**取，不做 5 元组解包：第 6 项（候选项）是可省的 —— 老调用点
+            #   （`tools/render_shots.py::shoot_api_dialogs`）仍是 5 元组，别改成必填。
+            attr, label, placeholder, initial = field[0], field[1], field[2], field[3]
+            is_password = bool(field[4]) if len(field) > 4 else False
+            choices = field[5] if len(field) > 5 else None
             # 旧标签写成「AI 名称：」是为了和输入框同行；现在标签独占一行，冒号去掉
             lbl = QLabel(str(label).rstrip("：:"))
             lbl.setStyleSheet("color:#334155; font-size:13px; background:transparent;")
             fields_box.addWidget(lbl)
-            edit = QLineEdit()
-            edit.setPlaceholderText(placeholder)
-            if initial:
-                edit.setText(str(initial))
-            if is_password:
-                edit.setEchoMode(QLineEdit.Password)
+            if choices is None:
+                edit = QLineEdit()
+                edit.setPlaceholderText(placeholder)
+                if initial:
+                    edit.setText(str(initial))
+                if is_password:
+                    edit.setEchoMode(QLineEdit.Password)
+            else:
+                # 可编辑下拉（**不是"只能选"**，见类文档）。样式走 HoverComboBox 自带的
+                # 那一套：`#F6FAFF` 底 + `#7DD3FC` 描边 + 15px 胶囊，与 design.md §4.3 一致。
+                edit = HoverComboBox()
+                edit.setEditable(True)
+                # ★★必须 `NoInsert`：否则「回车 = 确认」的那一击会顺手把编辑框里的字
+                #   **插进候选项列表**（Qt 的默认 InsertAtBottom）—— 越用越脏，而且这个脏
+                #   存不下来、下次开又没了，是最难查的那种。
+                edit.setInsertPolicy(QComboBox.NoInsert)
+                for c in choices:
+                    if isinstance(c, (tuple, list)) and len(c) == 2:
+                        edit.addItem(str(c[0]), c[1])      # (显示文本, userData)
+                    else:
+                        edit.addItem(str(c))
+                if placeholder:
+                    edit.lineEdit().setPlaceholderText(str(placeholder))
+                # ★**悬停显示完整文本**：卡片 360px 里这行编辑区只有 ~266px（要扣掉
+                #   24×2 内边距、左右边框、右侧 30px 的箭头钮），而「千问 Qwen ·
+                #   https://dashscope.aliyuncs.com/compatible-mode/v1」这种长地址必然被裁
+                #   ⇒ 完整值放 tooltip 兜底（不然用户没法确认自己选的是哪家 / 什么地址）。
+                edit.currentTextChanged.connect(
+                    lambda t, c=edit: c.setToolTip(str(t).strip()))
+                edit.setToolTip(edit.currentText().strip())
+                # ★**从下拉里"选"一项之后**把光标停回最前面 —— 光标停在末尾时编辑框会
+                #   滚动显示**尾部**，开头那截服务商名就被切掉了（看着像少了个字）。
+                #   ⚠️只连 `activated`（用户真的从列表里点了），**别连 `currentTextChanged`**
+                #   —— 那个在手输时也发，动光标会把用户打字位置打断。
+                edit.activated.connect(lambda _i, c=edit: _park_cursor(c))
+                if initial:
+                    _select_initial(edit, str(initial))
             # 宽度由卡片 360px − 左右各 24px 内边距决定，**不要**写 min-width
             fields_box.addWidget(edit)
             self.edits[attr] = edit
@@ -5938,12 +6412,73 @@ class ApiFormDialog(_CardDialog):
 
         self.setStyleSheet(_CARD_FRAME_QSS + _CARD_EDIT_QSS + _CARD_BTN_QSS)
 
-        # 回车 = 确认（与 InputDialog 一致）
+        # 回车 = 确认（与 InputDialog 一致）。★下拉框自己没有 `returnPressed`，
+        #   要从它内部那个编辑框上连（可编辑 combo 才有）。
         for edit in self.edits.values():
-            edit.returnPressed.connect(self.accept)
+            if isinstance(edit, QComboBox):
+                edit.lineEdit().returnPressed.connect(self.accept)
+            else:
+                edit.returnPressed.connect(self.accept)
+
+        # ★联动放在**最后**：这时所有控件与初值都已就位，铺候选项才不会把初值冲掉。
+        self._link_combos(link)
+
+    def _link_combos(self, link):
+        """把「接口地址 → 模型名」两个下拉接起来（规则见 `app/providers.py`）。"""
+        if not link:
+            return
+        src = self.edits.get(link[0])
+        dst = self.edits.get(link[1])
+        if not isinstance(src, QComboBox) or not isinstance(dst, QComboBox):
+            return
+        # ★顺序：**先**按地址的初值铺一遍模型候选项、**再**连信号。
+        #   铺的时候 `preserve_unknown=True` —— 编辑老条目时，用户自定义过的模型名
+        #   （比如方舟的接入点 `ep-xxxx`）要原样留住，不能因为"不在清单里"就被换掉。
+        self._refill_models(src, dst, preserve_unknown=True)
+        # 用户**主动换地址**时：换到新家 ⇒ 原模型名多半不属于新家 ⇒ 自动落到新家第一个
+        #   （用户口径「模型的下拉条…根据接口地址的不同选择来进行匹配替换」）。
+        src.currentTextChanged.connect(
+            lambda _t: self._refill_models(src, dst, preserve_unknown=False))
+
+    def _refill_models(self, src, dst, preserve_unknown: bool):
+        """按源（地址）重填目标（模型）的候选项。
+
+        ★源文本查不到一家（自定义地址）⇒ **什么都不做**：用户手填的模型名不能被清掉。
+        """
+        models = providers.models_for(providers.base_url_of(src.currentText()))
+        if not models:
+            return
+        keep = dst.currentText().strip()
+        dst.blockSignals(True)
+        dst.clear()
+        dst.addItems(models)
+        i = dst.findText(keep) if keep else -1
+        if i >= 0:
+            dst.setCurrentIndex(i)                       # ★在清单里 ⇒ 正正经经选中它
+        elif keep and preserve_unknown:
+            dst.setCurrentText(keep)                     # ★editable：自定义值也留得住
+        else:
+            dst.setCurrentIndex(0)                       # 换供应商 ⇒ 落到新家第一个
+        dst.blockSignals(False)
 
     def get(self, attr: str) -> str:
-        return self.edits[attr].text().strip()
+        w = self.edits[attr]
+        if isinstance(w, QComboBox):
+            # ★下拉的显示文本是「服务商名 · 地址」（给人看的），而**存进 config 的必须是
+            #   纯地址**（`ai.py` 拿它直接拼 `/chat/completions`）。纯地址挂在候选项的
+            #   userData 上，这里按**文本**反查候选项再取它。
+            #   ⚠️⚠️**不要**改用 `currentData()`：它跟着 `currentIndex` 走，而可编辑 combo
+            #   在用户**手输**时 `lineEdit().setText()` **根本不更新 `currentIndex`**
+            #   ⇒ `currentData()` 还停在上一个选中项的旧值 ⇒ 用户明明改了地址、存进配置的
+            #   却是旧地址（不报错、不抛异常）。用户手输的文本匹配不到候选项（`findText`
+            #   返回 -1）时，正好退回文本原文 —— 自定义地址要的就是这个。
+            i = w.findText(w.currentText())
+            if i >= 0:
+                data = w.itemData(i)
+                if isinstance(data, str) and data.strip():
+                    return data.strip()
+            return w.currentText().strip()
+        return w.text().strip()
 
     def confirmed(self) -> bool:
         return self.result() == QDialog.Accepted
@@ -6001,14 +6536,21 @@ class MainWindow(QWidget):
         self._on_pet_lock = None          # 「通用设置 → 桌宠固定」切换后的通知（main.py 注入）
         self._on_volume = None            # 「通用设置 → 音量」改动后的通知（main.py 注入）
         self._page_change_cb = None        # 右栏换页后的通知（main.py 用它重判桌宠气泡）
-        # ★P2（2026-10-02）常显状态条：`_health_facts_fn` 由 main.py 注入（只有它知道
+        # ★提示区（2026-10-02 改口径）：`_health_facts_fn` 由 main.py 注入（只有它知道
         #   「麦克风 / 语音识别就绪没」）；未注入时退回 `health.collect_facts`（只探模型）。
         #   ★`_health_facts` 是**缓存**：翻页时用 `refresh_health(recompute_facts=False)`
         #     复用上一次的结果 —— 免得每次切页都去 stat 一遍几百 MB 的模型目录。
+        #   ★★哪两行、什么时候出现，全由 `health` 说了算（`whitelist_notice` / `voice_notice`）；
+        #     MainWindow 只负责**摆**和**记住"这一轮已经关掉了"**。
         self._health_facts_fn = None
         self._health_facts = {}
-        self._health_status = None
-        self._health_full_text = ""
+        self._perm_dismissed = False       # 白名单那条被 ✕ 关掉了（本次运行内不再自动冒出来）
+        self._voice_dismissed = False      # 语音那条被 ✕ 关掉 / 倒计时走完了（启动只显示一次）
+        self._voice_left = 0
+        # ★"哪几行正在显示"必须**自己记**，不能用 `isVisible()` 反推：整块提示区一隐藏，
+        #   子控件的 `isVisible()` 就恒为 False（Qt 语义是"实际可见"）⇒ 永远算成 0 行、
+        #   提示区再也露不出来，而且**不报错**（本项目最怕的那一类）。
+        self._notice_on = {}
         self._quitting = False          # 正在退出：closeEvent 一律放行（见 closeEvent 注释）
         self._left_mode = self.LEFT_MODE_ROLE   # 左栏形态：role / manage / settings
         self._settings_page = self.SETTINGS_BASE   # 上次停留的设置页（右栏页索引）
@@ -6044,8 +6586,14 @@ class MainWindow(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(self._build_titlebar())
-        root.addWidget(self._build_health_strip())   # ★P2：常显状态条（标题栏正下方）
+        self._titlebar = self._build_titlebar()      # ★存下来：浮层要知道自己该从哪一行开始摆
+        root.addWidget(self._titlebar)
+        # ★★提示区**不进布局**（2026-10-02 用户点：关掉提示时下方界面会整体上移，很难看）：
+        #   它是主窗口的**浮层子控件**，由 `_position_notice_area()` 摆到标题栏正下方。
+        #   不进布局 ⇒ 它的显隐**完全不参与布局计算** ⇒ 关掉它时底下那半屏一个像素都不动。
+        #   ⚠️它建得比正文早（同一个 `_build` 里），所以显示时必须 `raise_()`，
+        #     否则会被后建的正文盖住（**不报错，就是看不见**）。
+        self._build_notice_area()
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
@@ -6054,61 +6602,257 @@ class MainWindow(QWidget):
         body.addWidget(self._build_right_panel(), 1)
         root.addLayout(body, 1)
 
-    # ---- P2：常显状态条（2026-10-02）----
+    # ---- 提示区（2026-10-02 改口径：白名单常显一行 + 启动时一次语音一行）----
 
-    HEALTH_H = 30       # 状态条高度
+    NOTICE_ROW_H = 30           # 每一行的高度（沿用 design.md §4.20 那一档）
+    NOTICE_MIN_W = 22           # ✕ 按钮的点击框（视觉上是 16px 的字）
+    NOTICE_TOP_FALLBACK = 48    # 取不到标题栏高度时的兜底（= `_build_titlebar` 的固定高）
+    # ★阴影（第五批用户口径「要加点阴影」→ ★★第六批用户点「把阴影改得更淡一点」）：
+    #   不给它影子的话，"浮在上面"这件事在浅蓝底 + 白底之间根本看不出来 —— 看起来就是一条
+    #   普通的分隔条；但它现在**正压在下方内容上**（浮层就是这么来的），太重会像一道脏边。
+    #   真机抓像素（860 宽，沿提示区底边那条竖线取第一格，背景白）：
+    #     α=70 ⇒ `#C5CCD5`（ΔR 58）/ α=50 ⇒ `#D6DAE1`(41) / **α=45 ⇒ `#DADDE3`(37)** /
+    #     α=40 ⇒ `#DDE1E7`(34) / α=34 ⇒ `#E2E5EA`(28)。
+    #   取 45 —— 比原来淡约 1/3，仍能一眼看出「这是一层浮在上面的东西」。
+    #   ⚠️别调回 70，也别一路淡到看不见（那等于把第五批那条改动白做）。
+    NOTICE_SHADOW_BLUR = 16
+    NOTICE_SHADOW_DY = 4
+    NOTICE_SHADOW_RGBA = (15, 42, 80, 45)   # 深蓝黑、α≈18%：与主色调同族，不用纯黑的灰
 
-    def _build_health_strip(self):
-        """标题栏正下方的**常显状态条**：一眼看出「她现在能不能用、不能的话卡在哪」。
+    def _build_notice_area(self):
+        """标题栏正下方的**提示区**（**浮层**）：最多两行，由 `health` 决定摆哪几行。
 
-        - 高 **30px**；浅蓝底 `#F6FAFF` + 1px 下边框 `#E6F1FB`（= design.md §1 的输入框底色
-          与弹窗边框，不新增颜色）。
-        - 左：8px 状态圆点 + 12px 文案；右：一颗「去设置」小按钮（**只在有落点时才出现**）。
-        - ★★**文案与落点都不由这里决定** —— `health.status_line()` 说了算。它与「一键自检」
-          「首次引导」用的是**同一份判据**，所以那三处不可能互相打架（见 app/health.py 抬头）。
-        - ★它是**常驻**的：一切就绪时显示绿色「一切就绪」而不是把自己藏起来 ——
-          用户要能靠它确认「现在到底正不正常」，藏起来就只剩「出问题时才出现」这一个信号，
-          反而分不清「没问题」和「这软件没有这个功能」。
+        - 浅蓝底 `#F6FAFF` + 1px 下边框 `#E6F1FB`（= design.md §1 的输入框底色与弹窗边框，
+          不新增颜色）；每行高 30px。
+        - ★★**它不在任何布局里**（2026-10-02 用户点）：`parent = 主窗口`，位置由
+          `_position_notice_area()` 算、`raise_()` 置顶 ⇒ 关掉它时下方界面**一点不上移**。
+          之前它是 `root.addWidget(...)` 摆进去的，占着 30px 的布局高度 ⇒ 一关就整屏上跳。
+        - 第 ① 行 = **白名单为空**（`health.whitelist_notice`）：每次启动都显示，
+          右侧只有 ✕、**没有倒计时**，点掉才消失。
+        - 第 ② 行 = **语音那条**（`health.voice_notice`）：只有启动时说一次，
+          右侧是「5s 倒计时 + ✕」，倒计时走完或点 ✕ 都消失。
+        - ★★**文案 / 顺序 / 存活时间都不由这里决定** —— `health` 说了算，
+          它与「一键自检」「使用引导」用的是**同一份判据**（见 app/health.py 抬头）。
+        - ★两行都没有时**整块收起来**（高度 0）：改口径前那条是「常显一切就绪」的绿字，
+          用户 2026-10-02 明确不要了 —— 没事就别占一行屏幕。
         """
-        bar = QFrame()
-        bar.setObjectName("healthStrip")
-        bar.setFixedHeight(self.HEALTH_H)
-        bar.setStyleSheet(
-            "QFrame#healthStrip{background:#F6FAFF; border:none;"
+        # ★parent = 主窗口，但**不进布局**（浮层，见方法抬头）
+        area = QFrame(self)
+        area.setObjectName("noticeArea")
+        area.setStyleSheet(
+            "QFrame#noticeArea{background:#F6FAFF; border:none;"
             " border-bottom:1px solid #E6F1FB;}"
         )
-        h = QHBoxLayout(bar)
-        h.setContentsMargins(20, 0, 20, 0)
+        shadow = QGraphicsDropShadowEffect(area)
+        shadow.setBlurRadius(self.NOTICE_SHADOW_BLUR)
+        shadow.setOffset(0, self.NOTICE_SHADOW_DY)
+        shadow.setColor(QColor(*self.NOTICE_SHADOW_RGBA))
+        area.setGraphicsEffect(shadow)
+        v = QVBoxLayout(area)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        # ★白名单那行在**上**、语音那行在**下**（用户口径「三条语音文案显示在白名单文案之下」）
+        self._perm_row = self._make_notice_row(with_countdown=False)
+        self._perm_row[4].clicked.connect(self._dismiss_perm_notice)
+        v.addWidget(self._perm_row[0])
+        self._voice_row = self._make_notice_row(with_countdown=True)
+        self._voice_row[4].clicked.connect(self._dismiss_voice_notice)
+        v.addWidget(self._voice_row[0])
+
+        self._voice_timer = QTimer(self)
+        self._voice_timer.setInterval(1000)
+        self._voice_timer.timeout.connect(self._tick_voice_notice)
+
+        # ★两行**初始都藏起来**：QWidget 建出来默认就是"可见"，不关掉的话，整块提示区一露头
+        #   就会多出一行空白（有圆点、有 ✕、没有字），而且它**不占 `_notice_on` 的计数**
+        #   ⇒ 高度也是错的。这两句是"少一句就露馅"的那一类。
+        self._perm_row[0].setVisible(False)
+        self._voice_row[0].setVisible(False)
+
+        self._notice_area = area
+        area.setVisible(False)
+        return area
+
+    def _make_notice_row(self, *, with_countdown: bool):
+        """造一行提示。返回 `(row, dot, label, countdown_label, close_btn)`。
+
+        ★倒计时那一格**无条件建出来**（不要的那行留空字符串）—— 两行的控件布局逐字相同，
+          只有"有没有字数"的区别；条件建控件会让两行的右边距在真机上对不齐。
+        """
+        row = QFrame()
+        row.setStyleSheet("background:transparent; border:none;")
+        row.setFixedHeight(self.NOTICE_ROW_H)
+        h = QHBoxLayout(row)
+        h.setContentsMargins(20, 0, 12, 0)
         h.setSpacing(8)
 
-        self._health_dot = _status_dot(health.LEVEL_OK)
-        h.addWidget(self._health_dot, 0, Qt.AlignVCenter)
+        dot = _status_dot(health.LEVEL_OK)
+        h.addWidget(dot, 0, Qt.AlignVCenter)
 
-        self._health_label = QLabel("")
-        self._health_label.setStyleSheet(
-            "color:#64748B; font-size:12px; background:transparent;"
-        )
+        label = QLabel("")
+        label.setStyleSheet("color:#64748B; font-size:12px; background:transparent;")
         # ★横向 `Ignored` + 自己按宽度省略（同 `_SettingRow` 的教训：不换行的 QLabel 的
-        #   minimumSizeHint 等于整段文字宽度，会把状态条顶宽、把右边那颗按钮挤出去）
-        pol = self._health_label.sizePolicy()
+        #   minimumSizeHint 等于整段文字宽度，会把这一行顶宽、把右边的 ✕ 挤出去）
+        pol = label.sizePolicy()
         pol.setHorizontalPolicy(QSizePolicy.Ignored)
-        self._health_label.setSizePolicy(pol)
-        h.addWidget(self._health_label, 1)
+        label.setSizePolicy(pol)
+        label.setToolTip("")            # 省略号后的完整文案靠 tooltip 兜住
+        h.addWidget(label, 1)
 
-        self._health_btn = QPushButton("去设置")
-        self._health_btn.setCursor(Qt.PointingHandCursor)
-        self._health_btn.setFixedSize(64, 22)
-        self._health_btn.setStyleSheet(
-            "QPushButton{background:transparent; color:#378ADD; border:1px solid #378ADD;"
-            " border-radius:8px; font-size:12px; padding:0;}"
-            "QPushButton:hover{background:#E6F1FB;}"
+        count = QLabel("")
+        count.setStyleSheet("color:#94A3B8; font-size:12px; background:transparent;")
+        count.setVisible(False)
+        h.addWidget(count, 0, Qt.AlignVCenter)
+
+        close = QPushButton("✕")
+        close.setCursor(Qt.PointingHandCursor)
+        close.setFixedSize(self.NOTICE_MIN_W, self.NOTICE_MIN_W)
+        close.setToolTip("关掉这条提示")
+        # ★灰色字 + 悬停浅灰底：与两行的浅蓝底同族，不抢主蓝（"颜色注意适配"）。
+        close.setStyleSheet(
+            "QPushButton{background:transparent; color:#94A3B8; border:none;"
+            " font-size:12px; padding:0;}"
+            "QPushButton:hover{background:#E6F1FB; color:#64748B; border-radius:4px;}"
         )
-        self._health_btn.clicked.connect(self._health_go)
-        self._health_btn.setVisible(False)
-        h.addWidget(self._health_btn, 0, Qt.AlignVCenter)
+        h.addWidget(close, 0, Qt.AlignVCenter)
+        return row, dot, label, count, close
 
-        self._health_strip = bar
-        return bar
+    def _set_notice(self, row_tuple, notice):
+        """把一条 `health.Notice` 灌进某一行的控件（并染上它那一档语义色）。"""
+        row, dot, label, _count, _close = row_tuple
+        color = _HL_COLORS.get(notice.level, "#64748B")
+        dot.setStyleSheet("background:%s; border-radius:4px;" % color)
+        label.setText(notice.text)
+        label.setStyleSheet("color:%s; font-size:12px; background:transparent;" % color)
+        label.setToolTip(notice.text)
+        row.setVisible(True)
+        # ★★状态必须**自己记**，不能靠 `row.isVisible()`：整块提示区一旦隐藏，
+        #   子控件的 `isVisible()` 就恒为 False（Qt 的语义是"实际可见"）⇒
+        #   用它算"该显示几行"会永远算成 0 行，提示区**再也露不出来**（而且不报错）。
+        self._notice_on[notice.key] = True
+
+    def _position_notice_area(self, rows=None):
+        """把浮层摆到「标题栏正下方、整窗宽」——★**它不在布局里，位置只能自己算**。
+
+        - `rows` 不给就按 `_notice_on` 现数（`resizeEvent` 走这条路：只是窗口变宽了）。
+        - 高度 = 行数 × 30；一行都没有时高度 0（配合 `setVisible(False)` 彻底不画）。
+        - ★宽度取**窗口宽**而不是某个父控件的宽：它挂的就是主窗口。
+        - ★`raise_()`：浮层必须在正文之上（见 `_build` 的注释）。
+        """
+        area = getattr(self, "_notice_area", None)
+        if area is None:
+            return
+        if rows is None:
+            rows = sum(1 for k in ("whitelist", "voice") if self._notice_on.get(k))
+        bar = getattr(self, "_titlebar", None)
+        top = bar.height() if (bar is not None and bar.height() > 0) else self.NOTICE_TOP_FALLBACK
+        area.setGeometry(0, top, self.width(), self.NOTICE_ROW_H * rows)
+        # ★立刻把内部布局跑一遍：不然紧接着的 `_apply_notice_elide()` 读到的还是
+        #   **上一次**的行宽（省略号会按旧宽度算 ⇒ 单次 resize 后文案被截错，
+        #   要等下一次 resize 才自己修好 —— 这类"慢一拍"最难查）。
+        lay = area.layout()
+        if lay is not None:
+            lay.activate()
+
+    def _apply_notice_layout(self):
+        """按"现在有几行要显示"收放整块提示区（都没了就把高度收到 0）。
+
+        ★高度先落到几何上、再 `setVisible`：反过来会在"高度还是旧值"的那一帧上闪一条空白。
+        """
+        shown = [r for key, r in (("whitelist", self._perm_row), ("voice", self._voice_row))
+                 if self._notice_on.get(key)]
+        area = getattr(self, "_notice_area", None)
+        if area is None:
+            return
+        self._position_notice_area(len(shown))
+        area.setVisible(bool(shown))
+        if shown:
+            area.raise_()       # ★浮层置顶（它建得比正文早，不 raise 会被正文盖住）
+        self._apply_notice_elide()
+
+    def _apply_notice_elide(self):
+        """提示区文案按当前宽度做右侧省略（窄窗口下不许把 ✕ 挤出去）。
+
+        ★**一律拿 `toolTip` 里的原文去省略**（`_set_notice` 会把完整文案同时写进 tooltip）：
+          宽度变回去时能自动还原，不会「越省略越短」——与 `PresetPanel` 那处同一条教训。
+        ★可见性判据同样用 `_notice_on`（理由见 `_set_notice`）。
+        """
+        for key, tup in (("whitelist", getattr(self, "_perm_row", None)),
+                         ("voice", getattr(self, "_voice_row", None))):
+            if not tup or not self._notice_on.get(key):
+                continue
+            lbl = tup[2]
+            full = lbl.toolTip()
+            avail = lbl.width()
+            if avail <= 0 or not full:
+                continue
+            elided = lbl.fontMetrics().elidedText(full, Qt.ElideRight, avail)
+            if elided != lbl.text():
+                lbl.setText(elided)
+
+    def _dismiss_perm_notice(self):
+        """白名单那条被 ✕ 关掉 ⇒ 本次运行不再显示（下次启动照旧会显示）。"""
+        self._perm_dismissed = True
+        self._notice_on.pop("whitelist", None)
+        self._perm_row[0].setVisible(False)
+        self._apply_notice_layout()
+
+    def _dismiss_voice_notice(self):
+        """语音那条被 ✕ 关掉 / 倒计时走完 ⇒ 收起来（**启动只显示一次**，不会自己回来）。"""
+        self._voice_dismissed = True
+        self._voice_timer.stop()
+        self._notice_on.pop("voice", None)
+        self._voice_row[0].setVisible(False)
+        self._apply_notice_layout()
+
+    def _tick_voice_notice(self):
+        self._voice_left -= 1
+        if self._voice_left <= 0:
+            self._dismiss_voice_notice()
+            return
+        self._voice_row[3].setText("%ds" % self._voice_left)
+
+    def show_startup_notices(self):
+        """启动时调**一次**：摆好提示区（白名单按现状 + 语音那条起倒计时）。
+
+        ★必须在 `main.py::_apply_model_gate()` **之后**调：那一步会在「没装模型」时
+          就地把她切进静音模式 —— 先摆提示的话，会摆出一条与配置不符的话
+          （说"静音模式已关闭"，可她其实已经被切进静音了）。
+        ★★语音那条**全生命周期只摆这一次**（`_voice_dismissed` 一旦为真就不再回来）：
+          用户口径是「提示仅在启动软件时显示一次」，refresh_health 那种高频回调
+          绝不能让它重新冒出来。
+        """
+        facts = self._compute_health_facts()
+        self._health_facts = facts
+        self._refresh_perm_notice()
+        if not self._voice_dismissed:
+            notice = health.voice_notice(self.cfg, facts.get("tts_installed"))
+            if notice is not None:
+                self._set_notice(self._voice_row, notice)
+                self._voice_left = max(1, int(notice.auto_ms) // 1000)
+                self._voice_row[3].setVisible(True)
+                self._voice_row[3].setText("%ds" % self._voice_left)
+                self._voice_timer.start()
+        self._apply_notice_layout()
+
+    def _refresh_perm_notice(self):
+        """白名单那一行：**按现状现算**（用户在权限页加完目录，切回来就该消失）。
+
+        ★只有它跟着 `refresh_health` 走；语音那条不跟（见 `show_startup_notices`）。
+        """
+        if self._perm_dismissed:
+            self._notice_on.pop("whitelist", None)
+            self._perm_row[0].setVisible(False)
+            return
+        notice = health.whitelist_notice(self.cfg)
+        if notice is None:
+            # ★「条件不再成立」这条路也要把**计数**清掉，只 `setVisible(False)` 是不够的
+            #   —— 计数留着，提示区就会为一行不显示的行留出 30px 空白。
+            self._notice_on.pop("whitelist", None)
+            self._perm_row[0].setVisible(False)
+        else:
+            self._set_notice(self._perm_row, notice)
 
     def set_health_facts_provider(self, fn):
         """注入「外部事实」的取值回调（main.py 用；返回 `{"tts_installed": bool|None,
@@ -6124,53 +6868,23 @@ class MainWindow(QWidget):
         return health.collect_facts(self.cfg)
 
     def refresh_health(self, recompute_facts: bool = True):
-        """重算状态条（返回那条 `Status`）。
+        """重算提示区（返回白名单那条 `Notice`，没有则 `None`）。
 
         - `recompute_facts=True`（默认）：**重新探一遍**外部事实（会 stat 模型目录）——
           启动、ASR 初始化完成、模型下载完成之后调它。
         - `recompute_facts=False`：**复用缓存的事实**，只重跑那几条纯判据（读 cfg）——
           翻页时调它，用来接住「用户刚在设置页填了 key / 加了目录 / 拨了静音」。
 
-        ★**故意不缓存结论**：每次现算。缓存了就会出现「改了设置、状态条还写着旧的」。
+        ★**故意不缓存结论**：每次现算。缓存了就会出现「改了设置、提示区还写着旧的」。
+        ★★**只碰白名单那一行**（+ 收放整块）：语音那条是「启动只显示一次」的，
+          绝不能在这里复活 —— 详见 `show_startup_notices`。
+        ★返回值仍保留（自检 / 测试要看「现在主提示是什么」），但**不再是**旧的 `Status`。
         """
         if recompute_facts:
             self._health_facts = self._compute_health_facts()
-        facts = self._health_facts or {}
-        st = health.status_line(
-            self.cfg,
-            tts_installed=facts.get("tts_installed"),
-            asr_ok=facts.get("asr_ok"),
-        )
-        self._health_status = st
-        self._health_full_text = st.text
-        self._health_label.setText(st.text)
-        self._health_label.setStyleSheet(
-            "color:%s; font-size:12px; background:transparent;" % _HL_COLORS.get(st.level, "#64748B")
-        )
-        self._health_dot.setStyleSheet(
-            "background:%s; border-radius:4px;" % _HL_COLORS.get(st.level, "#64748B")
-        )
-        self._health_btn.setVisible(st.page is not None)
-        self._apply_health_elide()
-        return st
-
-    def _apply_health_elide(self):
-        """状态条文案按当前宽度做右侧省略（窄窗口下不许把「去设置」挤出去）。"""
-        lbl = getattr(self, "_health_label", None)
-        if lbl is None or not self._health_full_text:
-            return
-        avail = lbl.width()
-        if avail <= 0:
-            return
-        elided = lbl.fontMetrics().elidedText(self._health_full_text, Qt.ElideRight, avail)
-        if elided != lbl.text():
-            lbl.setText(elided)
-
-    def _health_go(self):
-        """状态条右边那颗「去设置」。"""
-        st = getattr(self, "_health_status", None)
-        if st is not None:
-            self.open_health_target(st.page)
+        self._refresh_perm_notice()
+        self._apply_notice_layout()
+        return health.whitelist_notice(self.cfg)
 
     def open_health_target(self, page):
         """跳到某个问题所在的页（`page` 是 `health.PAGE_*` 字符串）。
@@ -6191,7 +6905,7 @@ class MainWindow(QWidget):
     # ---- P2：一键自检 / 检查更新 / 首次引导 ----
 
     def health_facts(self) -> dict:
-        """把「外部事实」取回来（自检清单与状态条**共用**这一份）。"""
+        """把「外部事实」取回来（自检清单与提示区**共用**这一份）。"""
         return self._compute_health_facts()
 
     def _build_checks(self):
@@ -6219,6 +6933,46 @@ class MainWindow(QWidget):
             self,
             health.guide_items(self.cfg),
             on_go=lambda: self.open_health_target(health.PAGE_API),
+        )
+
+    def show_model_setup(self):
+        """弹「要不要现在装语音模型」（首启那一次；2026-10-02 用户点六）。
+
+        ★**非阻塞**（见 `ModelSetupDialog.show_setup`）：启动路径里不许 `exec()` 一个模态窗，
+          否则 `main()` 回不去、四个「真跑一次 main()」的探针全挂。
+        ★点「立即安装」⇒ `start_model_download()`：**当场开下 + 跳到通用设置**，
+          让用户能直接看着进度条（用户口径）。
+        """
+        if voice_download.is_running():
+            return None                      # 已经在下了（比如上一轮没退干净）就别再问一遍
+        return ModelSetupDialog.show_setup(self, on_install=self.start_model_download)
+
+    def start_model_download(self):
+        """「立即安装」的落地：**先跳到通用设置**，再开始下载。
+
+        ★顺序不能反：`GeneralPanel._download_model()` 会把状态灌进那一行的控件、
+          并起一个 200ms 的轮询表；页面先切过去，用户在**同一帧**里就能看到「下载中 x%」。
+        ★`confirm=False`：用户刚刚在首启卡上按过「立即安装」，再弹一次「确认下载？」是多余的。
+        """
+        self.bring_to_front()
+        self._show_settings_page(self._settings_index.get("general", self.SETTINGS_BASE))
+        panel = self._settings_panels.get("general")
+        if panel is not None:
+            panel.start_download(confirm=False)
+
+    def notify_permission_denied(self):
+        """权限被拒 ⇒ 在聊天区出一条**可点**的灰字（点「去添加」跳权限管理）。
+
+        ★这是用户点三要的「出路」：以前只有角色把 `[权限拦截] …` 复述一遍，
+          技术词漏出来、却**不告诉老师去哪加白名单**。
+        ★★**不进聊天记录**：它是一次性的界面指路（重启后那条链接也没了），
+          写进历史只会在下次启动时变成一句没有链接的干巴巴的灰字。
+        ★返回那条 `QLabel`（测试要拿它发 `linkActivated` 验"点了真能跳"）。
+        """
+        return self._chat_view.add_system(
+            "这条指令被权限设置挡住了。",
+            link_text="去添加",
+            on_link=lambda: self.open_health_target(health.PAGE_PERMISSIONS),
         )
 
     def _build_divider(self):
@@ -6307,7 +7061,20 @@ class MainWindow(QWidget):
         self._drag_pos = None
         bar.mousePressEvent = self._title_mouse_press
         bar.mouseMoveEvent = self._title_mouse_move
-        bar.mouseDoubleClickEvent = lambda e: self.toggleMaximized()
+        # ★★2026-10-02 第六批（用户报「双击软件窗口顶部栏时会把窗口铺满整个屏幕」）：**不绑双击**。
+        #   这里原来有一句 `bar.mouseDoubleClickEvent = lambda e: self.toggleMaximized()`。
+        #   本窗口是 `FramelessWindowHint`，真机量到的 `GWL_STYLE = 0x96000000` —— 只有
+        #   `WS_POPUP|WS_VISIBLE|WS_CLIPSIBLINGS|WS_CLIPCHILDREN`，**没有**
+        #   `WS_THICKFRAME` / `WS_MAXIMIZEBOX` / `WS_CAPTION` ⇒
+        #     · 鼠标拖窗口边缘**本来就改不了大小**（没有 THICKFRAME，Windows 不给缩放边框，
+        #       Aero Snap 也不生效），系统按钮里也没有最大化；
+        #     · ⇒ **那条双击是唯一能把窗口撑到全屏的入口**。删掉它，「窗口大小恒定」就成立了
+        #       （用户口径：不能铺满全屏、也不能拉伸）。
+        #   ⚠️别再给它加任何最大化入口（`showMaximized` / `setWindowState` / 系统快捷键）。
+        #   ⚠️也别顺手改成 `setFixedSize` 来"加固" —— 用户要的是「**用户**改不了大小」，
+        #     不是「程序改不了」：`setFixedSize` 会让 `resize()` 一律变成空操作，而
+        #     `tools/render_shots.py` 按 860×560 出图、`tests/smoke_pipeline.py` 按不同窗宽
+        #     验证气泡上限，这些都靠程序自己 resize（见 `resizeEvent` 里那两条浮层重摆）。
         return bar
 
     # ---- 外部唤起（托盘 / 桌宠右键菜单）----
@@ -6320,11 +7087,12 @@ class MainWindow(QWidget):
         「右键桌宠 → 主界面 / 设置」点了等于没点。实测：最小化后 `show()`，`isMinimized()` 仍为真。
         所以最小化时改走 `showNormal()`（只清 `WindowMinimized` 位）。
 
-        为什么**不**无条件调 `showNormal()`：它在「可见的**最大化**窗口」上会把窗口还原成普通大小
-        （`toggleMaximized()` 正是靠这个语义），「最大化着点托盘」会被无辜缩小。
-        只在 `isMinimized()` 为真时才走它；而 Windows 上 Qt 把最大化位保留在最小化态里
-        （`windowState()` = `min|max`），所以「最大化 → 最小化 → 唤起」仍还原成最大化。
-        详见 docs/02 §17。
+        为什么**不**无条件调 `showNormal()`：它在「可见的**最大化**窗口」上会把窗口还原成普通大小，
+        「最大化着点托盘」会被无辜缩小。只在 `isMinimized()` 为真时才走它；而 Windows 上 Qt 把
+        最大化位保留在最小化态里（`windowState()` = `min|max`），所以「最大化 → 最小化 → 唤起」
+        仍还原成最大化。
+        ★2026-10-02 第六批起，本窗口**已没有任何最大化入口**（标题栏双击那条已删，见
+        `_build_titlebar`）⇒ 这段是**防御性**的，别据此又去补一个最大化入口。详见 docs/02 §17。
         """
         if self.isMinimized():
             self.showNormal()
@@ -6362,8 +7130,8 @@ class MainWindow(QWidget):
         """页面**真的换了**之后通知一次。
 
         必须排在 `setCurrentIndex()` **之后** —— 回调里要读的是新页面（`is_chat_page()`）。
-        ★这里**顺带重算一次状态条**（`recompute_facts=False`，只读 cfg、不 stat 模型目录）：
-          用户在设置页填完 key / 加完目录、切回聊天页时，状态条要当场变绿 ——
+        ★这里**顺带重算一次提示区**（`recompute_facts=False`，只读 cfg、不 stat 模型目录）：
+          用户在权限页加完目录、切回聊天页时，「可操作目录为空」那条要当场消失 ——
           否则它一直写着旧结论，比不显示还误导。
         """
         self.refresh_health(recompute_facts=False)
@@ -6457,11 +7225,10 @@ class MainWindow(QWidget):
         if self._drag_pos is not None and e.buttons() & Qt.LeftButton:
             self.move(e.globalPosition().toPoint() - self._drag_pos)
 
-    def toggleMaximized(self):
-        if self.isMaximized():
-            self.showNormal()
-        else:
-            self.showMaximized()
+    # ★★2026-10-02 第六批：`toggleMaximized()` 已**整个删掉**（用户口径「窗口大小永远保持不变」）。
+    #   它唯一的调用点是标题栏那条双击绑定，绑定删了它就再也没人调 —— 留着会让下一个读代码的
+    #   人以为"还有地方能最大化"（§26.4 的规矩：删控件要连槽函数一起删）。
+    #   ⚠️窗口的尺寸入口请一律走程序侧 `resize()`；用户侧没有任何入口（见 `_build_titlebar`）。
 
     def _build_left_panel(self):
         """左栏容器：白底角色区 ↔ 浅蓝底管理导航 / 设置导航，三者互斥切换。"""
@@ -7038,7 +7805,10 @@ class MainWindow(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._apply_rounded_corners()
-        self._apply_health_elide()      # 状态条按新宽度重新省略（P2）
+        # ★浮层不归布局管 ⇒ 窗口一变宽就得自己重新摆位、再按新宽度重算省略
+        #   （2026-10-02；少了这两句，改窗口大小后提示区会停在旧宽度上）
+        self._position_notice_area()
+        self._apply_notice_elide()
 
     # ---- 对外接口（main.py 依赖）----
     def set_status(self, state: State):

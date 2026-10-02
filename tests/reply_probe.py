@@ -134,10 +134,14 @@ _stub(
 import app.config as cfgmod  # noqa: E402
 
 _tmp_cfg = BASE / "tools" / "_reply_probe_config.json"
+# ★2026-10-02 起 API 是**每个角色一份独立列表**（`{角色key: [条目,…]}` / `{角色key: 名字}`）。
+#   本探针走的是**真的 `load_config`**（只是把 CONFIG_PATH 指到临时文件），所以旧扁平结构
+#   本来也能被迁移兜住；这里显式写成新结构，免得「迁移那条路」哪天坏了这套会跟着变哑。
 _tmp_cfg.write_text(
-    '{"apis": [{"name": "\u6d4b\u8bd5", "api_key": "sk-x",'
-    ' "base_url": "https://example.com/v1", "model": "m"}],'
-    ' "current_api": "\u6d4b\u8bd5"}',
+    '{"apis": {"alice": [{"name": "\u6d4b\u8bd5", "api_key": "sk-x",'
+    ' "base_url": "https://example.com/v1", "model": "m"}]},'
+    ' "current_api": {"alice": "\u6d4b\u8bd5"},'
+    ' "current_role": "alice"}',
     encoding="utf-8",
 )
 cfgmod.CONFIG_PATH = _tmp_cfg

@@ -1,11 +1,11 @@
-"""P2 体验三件套的**共用诊断内核**：首次使用引导 / 常显状态条 / 一键自检。
+"""P2 体验四件套的**共用诊断内核**：首次引导 / 启动提示区 / 一键自检 / 检查更新。
 
 ★★为什么是**一个**模块、而不是三处各判一遍
 ------------------------------------------------
-    这三处界面对「现在到底能不能用」必须给出**同一份**结论。各写各的 if，
-    迟早漂移成「一键自检说没问题、状态条却说没配 API Key」——本项目吃过这个亏
+    这几处界面对「现在到底能不能用」必须给出**同一份**结论。各写各的 if，
+    迟早漂移成「一键自检说没问题、启动提示区却说没配 API Key」——本项目吃过这个亏
     （同一量两处各写一份 ⇒ 静默漂移，见 docs/02 §24 的 `SWITCHABLE_ROLES`）。
-    所以判据**全部收在这里**，三段 UI 只负责**呈现**。
+    所以判据**全部收在这里**，几段 UI 只负责**呈现**。
 
 ★纯度：本模块不 import Qt、不读磁盘、不联网。
     唯一碰 I/O 的是 `collect_facts()`（给生产环境的薄封装，且整体被 try/except 包住），
@@ -14,7 +14,7 @@
 """
 from collections import namedtuple
 
-from .config import get_current_api
+from .config import get_current_api, has_any_api
 
 # 一个检查项。`level` 只有三档，刻意**不用 bool**：
 #   ok   —— 通过（绿）
@@ -22,8 +22,12 @@ from .config import get_current_api
 #   fail —— 这条功能现在是坏的（红）
 Check = namedtuple("Check", "key title level detail fix")
 
-# 常显状态条要显示的那一行。`page` 是「去设置」的落点（**字符串**，见下）。
-Status = namedtuple("Status", "text level page")
+# 启动提示区里的一行（2026-10-02 改口径）。
+#   key      —— "whitelist"（白名单，常显、手动关）/ "voice"（语音，5s 后自动消失）
+#   text     —— 要给用户看的那一句话
+#   level    —— 决定圆点与文字的颜色（三档同上）
+#   auto_ms  —— 多少毫秒后**自动**消失；`0` = 不自动消失，只能手动点 ✕
+Notice = namedtuple("Notice", "key text level auto_ms")
 
 LEVEL_OK = "ok"
 LEVEL_WARN = "warn"
@@ -35,6 +39,9 @@ LEVEL_FAIL = "fail"
 PAGE_API = "api"
 PAGE_GENERAL = "general"
 PAGE_PERMISSIONS = "permissions"
+
+# 语音那条提示的存活时间（用户口径：右侧 5s 倒计时 + ✕，倒计时完或点了 ✕ 就消失）。
+NOTICE_VOICE_MS = 5000
 
 
 # ---------------------------------------------------------------- 取值的唯一入口
@@ -165,54 +172,58 @@ def guide_items(cfg, *, tts_installed=None) -> list:
 
 
 def first_run_needed(cfg) -> bool:
-    """该不该弹「首次使用引导」：**还没配过任何 API** 就算首次。
+    """本机**还没配过任何角色的任何 API** —— 「新用户」的判据（★与「初次启动」是两件事）。
 
-    ★判据刻意只认「apis 为空」—— 白名单为空是**已知的设计**（README 也写着「默认是空的」），
-      拿它当「首次」会把老用户一遍遍弹；而一个 API 都没有时，她是**彻底不工作**的。
-    ★另一个入口是托盘菜单 / 设置页，用户随时可以重新打开引导（那时会显示各自的✓/✗）。
+    ★`config.json` 在不在才是「初次启动」（见 `config.is_first_launch`）；这里问的是
+      「配过了没有」。老用户（`config.json` 早就在）也可能一次都没配过 API。
+    ★白名单为空**不算**（默认就是空的，README 也写着），拿它当判据会天天把人当新人。
     """
-    apis = cfg.get("apis")
-    if not isinstance(apis, list):
-        return True
-    return not [a for a in apis if isinstance(a, dict) and str(a.get("name") or "").strip()]
+    return not has_any_api(cfg)
 
 
-def status_line(cfg, *, tts_installed=None, asr_ok=None) -> Status:
-    """常显状态条要显示的那一行 —— **取「最耽误事」的那一条**。
+# ---------------------------------------------------------------- 启动提示区（2026-10-02 改口径）
+def whitelist_notice(cfg) -> Notice | None:
+    """白名单为空时**每次启动都常显**的那一行；不空则 None（没什么好说的）。
 
-    优先级（从上往下第一个不通过的胜出）：
-        ① API 没配 —— 她根本不回复（最致命）
-        ② 语音识别挂了 —— 喊不醒（说不了话；打字仍可）
-        ③ 静音模式开着 —— 能用，但不出声
-        ④ 语音合成没就绪 —— 能用，但不出声
-        ⑤ 白名单为空 —— 对话没问题，但「打开文件」会被拒
-        全部通过 ⇒ 绿色「一切就绪」。
+    ★文案是**用户逐字给的**，别再"优化"它 —— 他说过要优化这类灰字时再动。
+    ★它 `auto_ms=0`：不自动消失，只能手动点 ✕（用户口径）。
     """
-    # ① API
-    c = check_api(cfg)
-    if c.level == LEVEL_FAIL:
-        return Status("还没配置 API Key —— 她收不到你的话，也不会回复。",
-                      LEVEL_FAIL, PAGE_API)
-    # ② ASR（只在**确定失败**时才顶上来；还在初始化就不吵用户）
-    if asr_ok is False:
-        return Status("语音识别未就绪 —— 喊唤醒词没反应（打字仍可聊天）。",
-                      LEVEL_FAIL, PAGE_GENERAL)
-    # ③ 静音模式（用户自己的选择，所以是 warn 不是 fail）
-    if mute_on(cfg):
-        return Status("静音模式已开启：回复只显示中文、不出声。",
-                      LEVEL_WARN, PAGE_GENERAL)
-    # ④ 语音合成
+    if allowed_dirs(cfg):
+        return None
+    return Notice(
+        "whitelist",
+        "可操作目录为空 —— 「打开文件 / 查看目录」指令会被拒绝。可在权限管理内添加",
+        LEVEL_WARN,
+        0,
+    )
+
+
+def voice_notice(cfg, tts_installed) -> Notice | None:
+    """**只能在启动时说一次**的那一行「为什么她现在会不会出声」。
+
+    三档（用户逐字给的文案，别再改）：
+        · 没装模型                ⇒ 「当前未安装音色克隆模型，默认开启静音模式」
+        · 有模型 + 静音开着        ⇒ 「当前为静音模式，无语音输出」
+        · 有模型 + 静音关着        ⇒ 「静音模式已关闭，输出时间可能较慢」
+    ★`tts_installed is None`（还没探到）⇒ **不出这一行**：宁可不说，也不能说假话。
+    """
     if tts_installed is False:
-        return Status("没找到音色克隆模型 —— 她只会显示文字，不会出声。",
-                      LEVEL_FAIL, PAGE_GENERAL)
-    # ⑤ 白名单
-    if not allowed_dirs(cfg):
-        return Status("可操作目录为空 —— 「打开文件 / 查看目录」会被拒绝。",
-                      LEVEL_WARN, PAGE_PERMISSIONS)
-    # ⑥ 还在初始化（清单还没跑完）：说得轻一点，别让人以为坏了
-    if asr_ok is None or tts_installed is None:
-        return Status("正在初始化（语音识别 / 语音合成）…", LEVEL_WARN, None)
-    return Status("一切就绪：喊一声唤醒词就能聊。", LEVEL_OK, None)
+        return Notice("voice", "当前未安装音色克隆模型，默认开启静音模式",
+                      LEVEL_WARN, NOTICE_VOICE_MS)
+    if tts_installed is not True:
+        return None
+    if mute_on(cfg):
+        return Notice("voice", "当前为静音模式，无语音输出", LEVEL_WARN, NOTICE_VOICE_MS)
+    return Notice("voice", "静音模式已关闭，输出时间可能较慢", LEVEL_OK, NOTICE_VOICE_MS)
+
+
+def startup_notices(cfg, *, tts_installed=None) -> list:
+    """启动时提示区要显示的全部行：**白名单那条在前、语音那条在其下**（用户口径）。
+
+    顺序在这里定，界面只照单摆 —— 顺序若各写各的，两处迟早不一样。
+    ★没配 API / 麦克风坏掉**都不在这里**：它们只走聊天区的灰字提示（用户 2026-10-02 口径）。
+    """
+    return [n for n in (whitelist_notice(cfg), voice_notice(cfg, tts_installed)) if n is not None]
 
 
 # ---------------------------------------------------------------- 唯一碰 I/O 的地方

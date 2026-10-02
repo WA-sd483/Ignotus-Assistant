@@ -8,14 +8,17 @@ from PySide6.QtGui import QFont, QGuiApplication, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from .autostart import is_autostart_launch, refresh_command
-from .config import (SWITCHABLE_ROLES, get_current_api, is_role_switchable,
-                     load_config, resolve_persona_text,
+from .config import (SWITCHABLE_ROLES, current_api_name, get_current_api, is_first_launch,
+                     is_role_switchable, load_config, resolve_persona_text,
                      save_config)   # ★可切换性真值（docs/02 §24）
+# ★current_api_name：API 自 2026-10-02 起是**每个角色一份独立列表**，问「当前用的是哪个」
+#   必须带上角色（`current_api_name(cfg, key)`）—— 直接读 `cfg["current_api"]` 拿到的是个 dict，
+#   与 `api_name` 比较会**永远不等** ⇒ 每条回复都被当成「API 被切走了」丢掉（界面：她一声不吭）。
 from .gui import MainWindow
 from .pet import PetWindow
 from .state import State
 from . import stats
-from . import health          # ★P2（2026-10-02）：诊断内核（状态条 / 自检 共用同一份判据）
+from . import health          # ★P2（2026-10-02）：诊断内核（提示区 / 自检 共用同一份判据）
 from . import logging_setup
 from .logging_setup import get_logger
 # ai（openai）与 asr（sherpa_onnx）加载较慢，均改为延迟导入：
@@ -37,6 +40,19 @@ WAKE_TIMEOUT_MS = 60_000
 
 # 休眠指令：说出这些词后进入待机（睡吧/休息吧 等）
 SLEEP_WORDS = ("睡吧", "休息吧", "睡觉", "晚安", "去睡", "睡了", "休眠", "我要睡了")
+
+# 权限被拒时**喂给模型**的那句话（2026-10-02 用户点三）。
+# ★它**不是**给用户看的文案，而是一条「这次发生了什么」的结果说明：要让角色按自己的设定
+#   说一句「我不太清楚…可以去权限管理里添加」，而**不是**把
+#   `[权限拦截] 路径「D:\…」不在允许操作的目录范围内，已拒绝执行。` 这种技术原文复述出来
+#   —— 用户看到的技术词就是这么漏出去的（角色转述 = 二次传话，没人能保证她不照念）。
+# ★口径与角色设定一致：爱丽丝**不自知是机器人**，所以不写"我没有权限/我是程序"这类说法。
+PERMISSION_DENIED_HINT = (
+    "操作结果：因为本机的安全设置，这件事没有做成。"
+    "请用你自己的语气告诉老师：你不太清楚该怎么做，"
+    "建议老师到「权限管理」里添加一下。"
+    "（「权限拦截」「白名单」「路径」这些是内部说法，不要说出来。）"
+)
 
 # 危险级操作的撤销词：只在「确实有待执行的危险操作」时生效，避免闲聊里出现"取消"被误判
 CANCEL_WORDS = (
@@ -263,6 +279,11 @@ def main() -> int:
         "QToolTip { color:#000000; background:#FFFFFF; border:1px solid #CBD5E1; border-radius:6px; padding:4px 8px; }"
     )
 
+    # ★★「初次启动」的判据 = **config.json 还不存在**（用户点六）。
+    #   必须在**任何 `save_config` 之前**取：退出时存过一次盘之后再问就永远是 False。
+    #   它与「有没有配过 API」是两件事 —— 后者走聊天区那条灰字提示。
+    first_launch = is_first_launch()
+
     cfg = load_config()
     role_key = cfg.get("current_role", "alice")
     # ★角色不可切换时兜底（2026-09-28；docs/02 §24）：历史 config 可能把 `current_role`
@@ -292,15 +313,15 @@ def main() -> int:
         """
         return bool((cfg.get("general") or {}).get("mute_mode", False))
 
-    # ★P2：语音识别是在**后台线程**里初始化的（见下面的 init_asr），而状态条 / 自检
+    # ★P2：语音识别是在**后台线程**里初始化的（见下面的 init_asr），而「一键自检」
     #   随时可能来问「起来了没」。用一个普通 dict 当跨线程信箱 —— 只存 True / False / None
-    #   （初始 None = 还不知道，状态条那时会说「正在初始化…」而不是诬赖它坏了）。
+    #   （初始 None = 还不知道，自检那时会说「正在后台初始化」而不是诬赖它坏了）。
     asr_state = {"ok": None}
 
     win = MainWindow(cfg)
     # ★P2（2026-10-02）：把「外部事实」的取值回调交给主窗口。
     #   **只有这里知道麦克风 / 语音识别到底起没起来**（它在后台线程里初始化，见下方 init_asr），
-    #   所以状态条与「一键自检」都得从这里拿 —— 别让它们各自去猜。
+    #   所以「一键自检」得从这里拿 —— 别让它自己去猜。
     #   `asr_state` 是个普通 dict：跨线程只传 bool/None（本项目铁律）。
     win.set_health_facts_provider(lambda: health.collect_facts(cfg, asr_ok=asr_state["ok"]))
     win.refresh_health()
@@ -693,7 +714,7 @@ def main() -> int:
         # 回复回来后若当前 API 已经换人，直接丢弃这条回复：
         # 保证同一时刻只有「当前 API」在参与对话，被换下去的 API 立即停止使用，
         # 不会出现旧 API 的回复和新 API 的回复同时冒出来的情况。
-        if api_name and api_name != cfg.get("current_api"):
+        if api_name and api_name != current_api_name(cfg, key):
             thinking_ui["pending"] = False
             win.hide_thinking()
             back_to_listening()
@@ -925,7 +946,7 @@ def main() -> int:
             if zh:
                 greet_ui["last"] = zh
         # 回复回来后若当前 API 已经换人，直接丢弃这条回复（同一时刻只有「当前 API」参与对话）
-        if api_name and api_name != cfg.get("current_api"):
+        if api_name and api_name != current_api_name(cfg, key):
             thinking_ui["pending"] = False
             win.hide_thinking()
             back_to_listening()
@@ -967,7 +988,9 @@ def main() -> int:
         set_usage_sink(stats.record_tokens)
         api = get_current_api(cfg)
         if canned is None and (not api or not api.get("api_key")):
-            win.add_system_message("（未配置 API Key，请先在左侧点击铅笔 → 管理 API）")
+            # ★2026-10-02 用户点一：没配 API 时**只**靠这一条灰字提示（不再往顶部提示区塞）。
+            #   文案按用户逐字给的来（引号换成项目惯用的「」，其余一字不改）。
+            win.add_system_message("当前未提供API，请在「管理API」界面中添加新的API KEY")
             back_to_listening()
             return
         # ★人设在这里**不再读文件**（2026-09-30 晚，「设定卡」可切换）：取值统一走
@@ -1044,7 +1067,10 @@ def main() -> int:
 
             def should_start():
                 # 开场前核一次 API 是否已被切走（切走了就当这条回复作废：不出字、不出声）
-                return not (api_name and api_name != cfg.get("current_api"))
+                # ★★必须带角色问（`current_api_name(cfg, key)`）：`cfg["current_api"]` 现在是
+                #   **每个角色一份的 dict**，拿它跟 `api_name`（str）比**永远不等** ⇒ 每条回复
+                #   都会被当成「API 被切走」丢掉，她一声不吭（不报错、只是哑）。与 717/949 行同款。
+                return not (api_name and api_name != current_api_name(cfg, key))
 
             def on_started():
                 speak_start_bridge.started.emit(key, zh_holder["zh"])
@@ -1251,8 +1277,17 @@ def main() -> int:
                 if action:
                     ok, reason = check_permission(action, text)
                     if not ok:
-                        # 被白名单挡住：把拒绝原因交给 AI，由角色如实说明（不静默失败）
-                        action_result = reason
+                        # ★★被白名单挡住（2026-10-02 用户点三）：**分两路**走。
+                        #   ① 技术原文（`[权限拦截] 路径…`）**只进日志** —— 它以前是被直接塞给
+                        #      模型复述的，"权限拦截 / 白名单 / 路径"这些词就是这么漏到
+                        #      用户眼前的（模型转述 = 二次传话，没人能保证她不照念）。
+                        #   ② 模型拿到的是 `PERMISSION_DENIED_HINT`：一句让她**按设定说人话**
+                        #      的结果说明（"我不太清楚…去权限管理里添加"）。
+                        #   ③ 界面另出一条**可点**的灰字（"去添加" → 权限管理页）——
+                        #      这才是用户要的"出路"：以前只告诉老师"被拦了"，不说去哪加。
+                        LOG.info("动作被权限拦截（原文只进日志）：%s", reason)
+                        action_result = PERMISSION_DENIED_HINT
+                        win.notify_permission_denied()
                     elif is_danger(action):
                         # 危险级：排入延迟队列，期间可说「取消」中止。回复**走固定文案**（不经 AI）——
                         # 「任务执行中…」/「ミッション実行中…」既快又不会被模型改写语义；
@@ -1368,13 +1403,22 @@ def main() -> int:
         win.hide()
     else:
         win.show()
-        # ★P2（2026-10-02）：首次使用引导 —— 只在这台机器上**一个 API 都还没配**时才弹。
-        #   ★★引导是**非阻塞**的（`FirstRunDialog.show_guide` 走 `open()` 而不是 `exec()`）：
+        # ★2026-10-02（用户点六）：**初次打开**（`config.json` 还不存在）时问一句
+        #   「要不要现在装语音模型」—— 旧口径那个「使用引导卡」不再自动弹了
+        #   （用户点一改口径：没配 API 只走聊天区那条灰字提示）。
+        #   ★★它是**非阻塞**的（`ModelSetupDialog.show_setup` 走 `open()` 而不是 `exec()`）：
         #     `exec()` 会在这里嵌一个模态事件循环，`main()` 就再也回不去了 ——
         #     那些「真跑一次 main()」的探针（boot_probe / reply_probe…）会直接挂到硬超时。
         #   ★延后 600ms：先把主窗口画出来，别一开机就糊一张弹窗在屏幕上。
-        if health.first_run_needed(cfg):
-            QTimer.singleShot(600, win.show_first_run)
+        if first_launch:
+            QTimer.singleShot(600, win.show_model_setup)
+        # ★2026-10-02（用户点一）：**当前角色**还没有可用 API ⇒ 聊天区出一句灰字。
+        #   判据走 `health.check_api`（与一键自检同一份），别在这里自己翻 cfg。
+        #   ★延后 200ms：让主窗口先把手上的启动消息（开机自启 / 路径自愈）落完，
+        #     这句提示排在最后，用户第一眼看到的是它。
+        if health.check_api(cfg).level == health.LEVEL_FAIL:
+            QTimer.singleShot(200, lambda: win.add_system_message(
+                "当前未提供API，请在「管理API」界面中添加新的API KEY"))
 
     pet.move(*pet_default_pos(pet))
 
@@ -1420,26 +1464,26 @@ def main() -> int:
 
             def _report_asr_ok():
                 win.add_system_message("语音识别已就绪，喊「爱丽丝」或「艾莲」试试")
-                # ★P2：状态条「正在初始化…」→「一切就绪」（要重探事实才敢说"就绪"）。
+                # ★P2：这里仍要重探一次事实（「一键自检」的语音识别那条跟着变）。
                 #   ★这个回调跑在**主线程**（QTimer），碰 Qt 是安全的。
                 win.refresh_health()
 
             QTimer.singleShot(0, _report_asr_ok)
-        except Exception as e:  # noqa: BLE001
-            # ★界面那条灰字里只有 `str(e)`（常常就一句 `[Errno 2] ...`，指不出任何位置）；
-            #   完整的调用栈进日志。用户看的和你看的，从此是两份东西。
+        except Exception:  # noqa: BLE001
+            # ★完整的调用栈（含 `str(e)`）进日志；**界面只说人话** —— 第四点口径：
+            #   原始异常（常常就一句 `[Errno 2] No such file or directory`）不进界面。
+            #   用户看的和你看的，从此是两份东西（照 `main.py:1429` 那条既有范例）。
             LOG.exception("语音识别初始化失败")
             listener = None
             asr_state["ok"] = False
-            # ★★必须在 except 块内先把原因取成局部变量：`except ... as e` 在**块结束时会 `del e`**
-            #   （连闭包里的 cell 一起清空）⇒ 这个内层函数是 QTimer 稍后在主线程才调的，
-            #   那一刻 `e` 已经没了，会抛 NameError —— 而 stderr 早已被兜到 devnull ⇒ 静默。
-            #   （2026-10-02 ruff 的 F821 抓出来的：这条灰字此前**从来没成功显示过**。）
-            reason = str(e)
 
+            # ★这里**不再**把原因取成局部变量：界面文案已是固定的人话。
+            #   （曾经的坑：`except ... as e` 在块末会 `del e`（连闭包 cell 一起清空）⇒
+            #    这个稍后才被 QTimer 调用的内层函数抛 NameError，又被 devnull 吞掉 ⇒ 静默。
+            #    2026-10-02 ruff 的 F821 抓出来的 —— 见 TECH-GOTCHAS §二十三。）
             def _report_asr_fail():
-                win.add_system_message(f"语音识别未就绪：{reason}")
-                win.refresh_health()      # ★P2：状态条当场说明「喊不醒」
+                win.add_system_message("未识别到麦克风")
+                win.refresh_health()      # 自检里「语音识别」那条跟着变
 
             QTimer.singleShot(0, _report_asr_fail)
 
@@ -1490,7 +1534,7 @@ def main() -> int:
     def _apply_model_gate():
         from . import voice_model
         if voice_model.is_installed(cfg):
-            win.refresh_health()          # ★P2：让状态条拿到「模型就位」这个事实
+            win.refresh_health()          # 让自检拿到「模型就位」这个事实
             return
         cfg.setdefault("general", {})["mute_mode"] = True
         win.sync_mute_mode(True)
@@ -1498,9 +1542,15 @@ def main() -> int:
             "没有找到音色克隆模型，已自动进入静音模式（回复只输出中文、不出声）。"
             "可在「设置 → 通用设置 → 语音模型」里查看状态。"
         )
-        win.refresh_health()              # ★P2：刚被判进静音 ⇒ 状态条要跟着说这一条
+        win.refresh_health()              # 刚被判进静音 ⇒ 自检那条要跟着变
 
     _apply_model_gate()
+
+    # ★★提示区（2026-10-02 改口径）：白名单那条常显 + 语音那条启动时显示一次（5s 倒计时）。
+    #   位置**必须在 `_apply_model_gate()` 之后** —— 那一步会在"没装模型"时就地把静音打开，
+    #   先摆提示的话会摆出一句与现状不符的话（说"静音模式已关闭"，可她已经被切进静音了）。
+    #   ★它与上面那句「未提供API」不冲突：那条走聊天区，这条走标题栏下方，互不覆盖。
+    win.show_startup_notices()
 
     return app.exec()
 

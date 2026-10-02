@@ -41,8 +41,13 @@ cfgmod.CONFIG_PATH = tmp_cfg
 check("默认模型名为 deepseek-flash", cfgmod.DEFAULT_MODEL == "deepseek-flash", cfgmod.DEFAULT_MODEL)
 
 cfg = cfgmod.load_config()
-check("默认 apis 为空列表", cfg["apis"] == [], str(cfg["apis"]))
-check("默认 current_api 为空串", cfg["current_api"] == "", repr(cfg["current_api"]))
+# ★★2026-10-02：API 改成**每个角色一份独立列表** —— 结构与默认值都变了。
+check("默认 apis 每个角色各一份空列表",
+      cfg["apis"] == {"alice": [], "ellen": []}, str(cfg["apis"]))
+check("默认 current_api 每个角色各一个空串",
+      cfg["current_api"] == {"alice": "", "ellen": ""}, repr(cfg["current_api"]))
+check("角色清单来自 cfg[roles]（role_keys 是唯一入口）",
+      cfgmod.role_keys(cfg) == ["alice", "ellen"], str(cfgmod.role_keys(cfg)))
 
 # 旧配置（只有 name + api_key）应自动补全 base_url / model
 tmp_cfg.write_text(json.dumps({
@@ -56,23 +61,28 @@ tmp_cfg.write_text(json.dumps({
     "current_api": "旧配置",
 }), encoding="utf-8")
 cfg = cfgmod.load_config()
-check("无名/非 dict 条目被丢弃", [a["name"] for a in cfg["apis"]] == ["旧配置", "自定义"],
+# ★旧结构（扁平列表）⇒ 一律搬进 alice（见 `config._normalize_apis` 的理由）
+_alice = cfg["apis"]["alice"]
+check("无名/非 dict 条目被丢弃", [a["name"] for a in _alice] == ["旧配置", "自定义"],
       str(cfg["apis"]))
-check("缺 base_url 自动补默认值", cfg["apis"][0]["base_url"] == cfgmod.DEFAULT_BASE_URL,
-      cfg["apis"][0]["base_url"])
-check("缺 model 自动补默认值", cfg["apis"][0]["model"] == "deepseek-flash",
-      cfg["apis"][0]["model"])
+check("缺 base_url 自动补默认值", _alice[0]["base_url"] == cfgmod.DEFAULT_BASE_URL,
+      _alice[0]["base_url"])
+check("缺 model 自动补默认值", _alice[0]["model"] == "deepseek-flash",
+      _alice[0]["model"])
 check("已有 base_url/model 不被覆盖",
-      cfg["apis"][1]["base_url"] == "https://api.moonshot.cn/v1"
-      and cfg["apis"][1]["model"] == "moonshot-v1-8k")
+      _alice[1]["base_url"] == "https://api.moonshot.cn/v1"
+      and _alice[1]["model"] == "moonshot-v1-8k")
+check("★迁移只落 alice：ellen 留空（不按 current_role 落 —— 她当前根本切不过去）",
+      cfg["apis"]["ellen"] == [], str(cfg["apis"]["ellen"]))
 
 # 迁移：旧版单 key 结构
 tmp_cfg.write_text(json.dumps({"api_key": "sk-legacy"}), encoding="utf-8")
 cfg = cfgmod.load_config()
-check("旧版 api_key 迁移为 apis 列表",
-      len(cfg["apis"]) == 1 and cfg["apis"][0]["api_key"] == "sk-legacy",
+_legacy = cfg["apis"]["alice"]
+check("旧版 api_key 迁移为该角色的 apis 列表",
+      len(_legacy) == 1 and _legacy[0]["api_key"] == "sk-legacy",
       str(cfg["apis"]))
-check("迁移条目也补全 model", cfg["apis"][0]["model"] == "deepseek-flash")
+check("迁移条目也补全 model", _legacy[0]["model"] == "deepseek-flash")
 
 # current_api 无效时回落到第一个
 tmp_cfg.write_text(json.dumps({
@@ -80,7 +90,30 @@ tmp_cfg.write_text(json.dumps({
     "current_api": "不存在",
 }), encoding="utf-8")
 cfg = cfgmod.load_config()
-check("current_api 无效时回落到第一个", cfg["current_api"] == "A", cfg["current_api"])
+check("current_api 无效时回落到该角色的第一个",
+      cfg["current_api"]["alice"] == "A", str(cfg["current_api"]))
+
+# ---- ★每角色独立：一个角色改了当前 API，另一个必须纹丝不动 ----
+tmp_cfg.write_text(json.dumps({
+    "apis": {"alice": [{"name": "A1", "api_key": "sk-a1"}],
+             "ellen": [{"name": "E1", "api_key": "sk-e1"}]},
+    "current_api": {"alice": "A1", "ellen": "E1"},
+}), encoding="utf-8")
+cfg = cfgmod.load_config()
+check("★两个角色各自记住自己的当前 API",
+      (cfgmod.current_api_name(cfg, "alice"), cfgmod.current_api_name(cfg, "ellen"))
+      == ("A1", "E1"))
+check("★get_current_api 带角色取的是那一份（默认取当前角色）",
+      cfgmod.get_current_api(cfg, "ellen")["api_key"] == "sk-e1"
+      and cfgmod.get_current_api(cfg)["api_key"] == "sk-a1",
+      str(cfgmod.get_current_api(cfg)))
+cfgmod.set_current_api(cfg, "A1", "ellen")
+check("★改一个角色的当前 API 不影响另一个（就地改，不重写整个 dict）",
+      (cfgmod.current_api_name(cfg, "alice"), cfgmod.current_api_name(cfg, "ellen"))
+      == ("A1", "A1"))
+check("has_any_api：任一角色配过就算配过", cfgmod.has_any_api(cfg) is True)
+check("has_any_api：全空才算没配过",
+      cfgmod.has_any_api({"apis": {"alice": [], "ellen": []}}) is False)
 
 
 # ========== 2. ai.resolve_endpoint / 模型名 ==========
@@ -495,6 +528,83 @@ tmp_cfg.write_text(json.dumps({"apis": [], "current_api": ""}), encoding="utf-8"
 cfg = cfgmod.load_config()
 panel = gui.ApiPanel(cfg)
 check("空列表时下拉菜单无项", panel.api_combo.count() == 0, str(panel.api_combo.count()))
+check("★本页操作的就是「当前角色」那一份（_role_key 固定在进来时的角色）",
+      panel._role_key == "alice", panel._role_key)
+check("★★「配置哪个角色」那行已删（2026-10-02 用户点二：页内不切角色）",
+      not hasattr(panel, "role_combo")
+      and all("配置哪个角色" != w.text() for w in panel.findChildren(gui.QLabel)))
+check("★「当前 API」标题在（2026-10-02 用户口径：原来的「当前使用的 API」改短），"
+      "且背景**显式透明**（面板级 `QWidget{background:#FFFFFF}` 会把它染成一条白带，"
+      "卡片其实是 #F6FAFF）",
+      panel._cur_head.text() == "当前 API"
+      and "background:transparent" in panel._cur_head.styleSheet().replace(" ", ""),
+      "%r / %r" % (panel._cur_head.text(), panel._cur_head.styleSheet()))
+check("★「管理 API」标题旁有问号说明按钮（圆圈框住问号）",
+      panel.help_btn.text() == "?" and panel.help_btn.width() == panel.help_btn.height()
+      and panel.help_btn.width() == gui.ApiPanel.HELP_D, str(panel.help_btn.size()))
+
+
+def _inside_page(w):
+    """w 是不是「整页」内容容器（`_scroll.widget()`）的后代。"""
+    page = panel._scroll.widget()
+    while w is not None:
+        if w is page:
+            return True
+        w = w.parent()
+    return False
+
+
+check("★★整页滚动（2026-10-02 用户点三）：页面里只有一个滚动区，标题 / 当前 API 卡片 / "
+      "列表 / 提示全在它里面（原来只有「已有 API」那一段能滑）",
+      len(panel.findChildren(gui.QScrollArea)) == 1
+      and _inside_page(panel.help_btn) and _inside_page(panel._cur_head)
+      and _inside_page(panel._list_container) and _inside_page(panel._msg_label))
+
+
+# ---- ★★像素级回归守卫（2026-10-02 用户报「当前 API 那条底色不统一」+ 按钮看不见）----
+# 这一条**必须抓像素**，样式表断言兜不住：真因是 `page` 上那句
+# `setStyleSheet("background:transparent;")` —— Qt 的规矩是「样式表设在某个控件上 ⇒ 对
+# 它自己、以及**它的全部子孙**生效」，于是卡片 `QFrame#card{#F6FAFF}` 被压成白的、
+# 主按钮 `QPushButton{#378ADD}` 成了「白底白字」（**整个按钮看不见**）。
+# ★★而 `_apply_style` 里那条 `QFrame#card { background:#F6FAFF; ... }` **还好端端写着**
+#   —— 它只是**不生效**而已 ⇒ 任何"样式表里有这句吗"的断言都会绿。唯一能守住的是像素。
+def _px(w, x, y):
+    """抓控件上某个**设备无关坐标**的 RGB 名字（离屏也能抓：`grab()` 不要求控件真的显示）。
+
+    ★`devicePixelRatio` 在 offscreen 平台是 1，但真机上可能是 2 —— 老实乘上去，
+      不然采样点会落在控件外（拿到的是一坨背景色，表现为"偶发红"）。
+    """
+    pm = w.grab()
+    dpr = float(pm.devicePixelRatio() or 1.0)
+    img = pm.toImage()
+    x = min(max(int(x * dpr), 0), img.width() - 1)
+    y = min(max(int(y * dpr), 0), img.height() - 1)
+    return img.pixelColor(x, y).name().upper()
+
+
+panel.resize(860, 620)          # 给个真尺寸：`grab()` 抓的是控件的实际渲染
+panel.show()
+for _ in range(3):
+    qapp.processEvents()
+
+_cur_card = panel.findChild(gui.QFrame, "card")
+check("★★`page` 上**没有**样式表（那句 `background:transparent` 会把整棵子树的底色压平，"
+      "是本批「卡片变白 + 按钮隐形」的唯一真因；重设面板样式 / 挪到最后 / 改写成 "
+      "`QWidget{background:transparent}` **都无效**）",
+      panel._scroll.widget().styleSheet() == "", repr(panel._scroll.widget().styleSheet()))
+check("★★卡片留白真的是 #F6FAFF（**H213S4B100**，design.md §1 的输入框淡蓝）"
+      "—— 被压成 transparent 时它抓出来是 **#000000**（离屏抓图里透明区就是黑的），"
+      "而样式表断言照样绿",
+      _px(_cur_card, 6, _cur_card.height() // 2) == "#F6FAFF",
+      _px(_cur_card, 6, _cur_card.height() // 2))
+check("★★「添加 API」主按钮真的是 #378ADD —— 被压成 transparent 时它是 **#000000**"
+      "（离屏抓图里透明区是黑的；真机上则是「白底 + 白字」= **整个按钮看不见**），"
+      "而且不报错",
+      _px(panel.add_api_btn, 5, panel.add_api_btn.height() // 2) == "#378ADD",
+      _px(panel.add_api_btn, 5, panel.add_api_btn.height() // 2))
+check("★面板底色仍是白（卡片能看出淡蓝的对照）",
+      _px(panel, 2, 2) == "#FFFFFF", _px(panel, 2, 2))
+panel.hide()
 
 
 class FakeForm:
@@ -502,9 +612,11 @@ class FakeForm:
     next_values = {}
     next_confirm = True
     last_title = None
+    last_fields = None
 
     def __init__(self, title, fields, parent=None):
         FakeForm.last_title = title
+        FakeForm.last_fields = fields
         self.fields = fields
         self.confirm_btn = object()          # 模拟按钮对象
 
@@ -527,53 +639,60 @@ FakeForm.next_values = {"name": "爱丽丝", "api_key": "sk-alice",
                         "base_url": "", "model": ""}
 panel._add_api()
 check("添加成功（不再 AttributeError）",
-      len(cfg["apis"]) == 1 and cfg["apis"][0]["name"] == "爱丽丝", str(cfg["apis"]))
+      len(cfg["apis"]["alice"]) == 1 and cfg["apis"]["alice"][0]["name"] == "爱丽丝",
+      str(cfg["apis"]))
+check("★只加进了当前编辑的那个角色，另一个角色一份都没有",
+      cfg["apis"]["ellen"] == [], str(cfg["apis"]["ellen"]))
 check("添加对话框标题为「添加 API」", FakeForm.last_title == "添加 API", str(FakeForm.last_title))
 check("空白 base_url/model 回退默认",
-      cfg["apis"][0]["base_url"] == cfgmod.DEFAULT_BASE_URL
-      and cfg["apis"][0]["model"] == "deepseek-flash", str(cfg["apis"][0]))
-check("新添加的成为当前 API", cfg["current_api"] == "爱丽丝", cfg["current_api"])
+      cfg["apis"]["alice"][0]["base_url"] == cfgmod.DEFAULT_BASE_URL
+      and cfg["apis"]["alice"][0]["model"] == "deepseek-flash", str(cfg["apis"]["alice"][0]))
+check("新添加的成为**该角色**的当前 API",
+      cfg["current_api"]["alice"] == "爱丽丝", str(cfg["current_api"]))
+check("★ellen 的「当前 API」没被顺手改掉（独立列表的底线）",
+      cfg["current_api"]["ellen"] == "", str(cfg["current_api"]))
 check("下拉菜单同步 1 项", panel.api_combo.count() == 1, str(panel.api_combo.count()))
 
 # --- 添加 2：自定义服务与模型 ---
 FakeForm.next_values = {"name": "Kimi", "api_key": "sk-kimi",
                         "base_url": "https://api.moonshot.cn/v1", "model": "moonshot-v1-8k"}
 panel._add_api()
-check("可添加第二个 API", len(cfg["apis"]) == 2, str(cfg["apis"]))
+check("可添加第二个 API", len(cfg["apis"]["alice"]) == 2, str(cfg["apis"]))
 check("第二个 API 保留自定义端点",
-      cfg["apis"][1]["base_url"] == "https://api.moonshot.cn/v1"
-      and cfg["apis"][1]["model"] == "moonshot-v1-8k", str(cfg["apis"][1]))
-check("当前 API 切到新添加的", cfg["current_api"] == "Kimi", cfg["current_api"])
+      cfg["apis"]["alice"][1]["base_url"] == "https://api.moonshot.cn/v1"
+      and cfg["apis"]["alice"][1]["model"] == "moonshot-v1-8k", str(cfg["apis"]["alice"][1]))
+check("当前 API 切到新添加的", cfg["current_api"]["alice"] == "Kimi", str(cfg["current_api"]))
 
 # --- 重名：应被拒绝 ---
 FakeForm.next_values = {"name": "Kimi", "api_key": "sk-dup",
                         "base_url": "", "model": ""}
 panel._add_api()
-check("重名被拒绝", len(cfg["apis"]) == 2, str(cfg["apis"]))
+check("重名被拒绝", len(cfg["apis"]["alice"]) == 2, str(cfg["apis"]))
 
 # --- 缺 key：应被拒绝 ---
 FakeForm.next_values = {"name": "缺key", "api_key": "", "base_url": "", "model": ""}
 panel._add_api()
-check("缺 API Key 被拒绝", len(cfg["apis"]) == 2, str(cfg["apis"]))
+check("缺 API Key 被拒绝", len(cfg["apis"]["alice"]) == 2, str(cfg["apis"]))
 
 # --- 取消：不应新增 ---
 FakeForm.next_confirm = False
 FakeForm.next_values = {"name": "取消的", "api_key": "sk-x", "base_url": "", "model": ""}
 panel._add_api()
-check("取消添加不产生新条目", len(cfg["apis"]) == 2, str(cfg["apis"]))
+check("取消添加不产生新条目", len(cfg["apis"]["alice"]) == 2, str(cfg["apis"]))
 FakeForm.next_confirm = True
 
 # --- 下拉切换：切走旧 API，当前 API 立即变为新选中的 ---
 panel.api_combo.setCurrentIndex(0)          # 0 → 爱丽丝
 qapp.processEvents()
-check("下拉切换后 current_api == 爱丽丝", cfg["current_api"] == "爱丽丝", cfg["current_api"])
+check("下拉切换后 current_api[alice] == 爱丽丝",
+      cfg["current_api"]["alice"] == "爱丽丝", str(cfg["current_api"]))
 check("被切走的 API 仍保留在列表（仅停用不删除）",
-      [a["name"] for a in cfg["apis"]] == ["爱丽丝", "Kimi"], str(cfg["apis"]))
+      [a["name"] for a in cfg["apis"]["alice"]] == ["爱丽丝", "Kimi"], str(cfg["apis"]))
 check("切换已持久化到磁盘",
-      json.loads(tmp_cfg.read_text(encoding="utf-8"))["current_api"] == "爱丽丝")
+      json.loads(tmp_cfg.read_text(encoding="utf-8"))["current_api"]["alice"] == "爱丽丝")
 
 # --- 编辑：改模型名 ---
-entry = cfg["apis"][1]
+entry = cfg["apis"]["alice"][1]
 FakeForm.next_values = {"name": "Kimi", "base_url": "https://api.moonshot.cn/v1",
                         "model": "moonshot-v1-32k"}
 panel._edit_row(entry, None)
@@ -582,20 +701,82 @@ check("编辑改掉模型名", entry["model"] == "moonshot-v1-32k", entry["model
 check("编辑不丢失 base_url", entry["base_url"] == "https://api.moonshot.cn/v1", entry["base_url"])
 
 # --- 编辑改名：若改的是当前 API，current_api 跟随 ---
-cur = cfg["current_api"]
-cur_entry = next(a for a in cfg["apis"] if a["name"] == cur)
+cur = cfg["current_api"]["alice"]
+cur_entry = next(a for a in cfg["apis"]["alice"] if a["name"] == cur)
 FakeForm.next_values = {"name": cur + "改", "base_url": cur_entry["base_url"],
                         "model": cur_entry["model"]}
 panel._edit_row(cur_entry, None)
-check("改名后 current_api 跟随", cfg["current_api"] == cur + "改", cfg["current_api"])
+check("改名后 current_api 跟随",
+      cfg["current_api"]["alice"] == cur + "改", str(cfg["current_api"]))
 
 # --- 编辑重名：应被拒绝 ---
-names_before = [a["name"] for a in cfg["apis"]]
+names_before = [a["name"] for a in cfg["apis"]["alice"]]
 FakeForm.next_values = {"name": names_before[0], "base_url": "", "model": "x"}
-panel._edit_row(cfg["apis"][1], None)
-check("编辑重名被拒绝", [a["name"] for a in cfg["apis"]] == names_before, str(cfg["apis"]))
+panel._edit_row(cfg["apis"]["alice"][1], None)
+check("编辑重名被拒绝",
+      [a["name"] for a in cfg["apis"]["alice"]] == names_before, str(cfg["apis"]))
 
 gui.ApiFormDialog = _gui_form
+
+# --- ★每个角色的列表互相独立（2026-10-02 用户点一）---
+#   页内已经没有「配置哪个角色」了 ⇒ 另一位角色由**另一个面板实例**来验
+#   （`_role_key` 固定在构造时；等艾莲能切了，打开这一页的人会换成她）。
+FakeForm.next_confirm = True
+FakeForm.next_values = {"name": "艾莲的key", "api_key": "sk-alice-again",
+                        "base_url": "", "model": ""}
+gui.ApiFormDialog = FakeForm
+panel_e = gui.ApiPanel(cfg)
+panel_e._role_key = "ellen"                  # 等价于「打开这一页时当前角色是艾莲」
+panel_e.refresh()
+check("★切到艾莲后列表是空的下拉（说明换的是另一份列表）",
+      panel_e.api_combo.count() == 0, str(panel_e.api_combo.count()))
+panel_e._add_api()
+check("★给艾莲加 API：落在 ellen 名下",
+      [a["name"] for a in cfg["apis"]["ellen"]] == ["艾莲的key"], str(cfg["apis"]))
+check("★爱丽丝那一份一个字节都没动",
+      [a["name"] for a in cfg["apis"]["alice"]] == ["爱丽丝改", "Kimi"],
+      str(cfg["apis"]["alice"]))
+check("★同一个 key 值可以在两个角色下各存一份（命名各自独立）",
+      cfg["apis"]["ellen"][0]["api_key"] == "sk-alice-again")
+
+# --- ★删掉艾莲的那份，爱丽丝的不受影响 ---
+_e_entry = cfg["apis"]["ellen"][0]
+panel_e._delete(_e_entry)
+check("★删掉艾莲的 API ⇒ 爱丽丝那一份仍然原样",
+      cfg["apis"]["ellen"] == []
+      and [a["name"] for a in cfg["apis"]["alice"]] == ["爱丽丝改", "Kimi"],
+      str(cfg["apis"]))
+check("★删除后「当前 API」回落到该角色列表里的第一个（这里是空串）",
+      cfg["current_api"]["ellen"] == "", str(cfg["current_api"]))
+check("★爱丽丝的当前 API 仍指着她自己那一个",
+      cfg["current_api"]["alice"] == "爱丽丝改", str(cfg["current_api"]))
+panel_e.deleteLater()
+gui.ApiFormDialog = _gui_form                # ★用完全部替身，还回去（第 4 段要用真弹窗）
+
+# --- ★行为：内容超出窗口高度时**整页**可滑（2026-10-02 用户点三）---
+from PySide6.QtCore import QCoreApplication, QEvent  # noqa: E402
+
+panel.resize(460, 240)
+panel.show()
+for _ in range(3):
+    qapp.processEvents()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+_bar = panel._scroll.verticalScrollBar()
+check("★内容超出窗口高度时出现滚动区间", _bar.maximum() > 0, str(_bar.maximum()))
+_bar.setValue(_bar.maximum())
+qapp.processEvents()
+check("★拉到底时页面**顶部**（标题旁那个 ?）确实滚出了视野 —— 滚的是整页，不只是列表",
+      panel.help_btn.mapTo(panel._scroll.viewport(),
+                           panel.help_btn.rect().topLeft()).y() < 0,
+      str(panel.help_btn.mapTo(panel._scroll.viewport(),
+                               panel.help_btn.rect().topLeft()).y()))
+panel.resize(460, 900)                       # 还回去，别影响后面的段落
+for _ in range(2):
+    qapp.processEvents()
+check("★窗口够高时不需要滚动（区间归零）",
+      panel._scroll.verticalScrollBar().maximum() == 0,
+      str(panel._scroll.verticalScrollBar().maximum()))
+panel.hide()
 
 
 # ========== 4. 真实对话框结构（防回归） ==========
@@ -681,6 +862,158 @@ check("三个弹窗的「确认」同为蓝底",
       len(_confirms) == 1 and "#378ADD" in sorted(_confirms)[0], str(sorted(_confirms)))
 for _d in _dialogs:
     _d.deleteLater()
+
+
+# ========== 4b. 「接口地址 / 模型名」可编辑下拉 + 联动（rev50）==========
+# 用户口径（2026-10-02）：「添加API里的接口地址和模型这两项需要能通过下拉条选择」，
+# 并明确「**保留手输**」（下拉可编辑）、「接口地址默认为 deepseek」、
+# 「模型的下拉条…根据接口地址的不同选择来进行匹配替换」。
+print("== 4b. 接口地址 / 模型名 下拉 ==")
+from app import providers  # noqa: E402
+
+check("★第一家就是 DeepSeek，地址 = `config.DEFAULT_BASE_URL`（两处各写一份 ⇒ 改一处漏一处）",
+      providers.PROVIDERS[0]["name"] == "DeepSeek"
+      and providers.PROVIDERS[0]["base_url"] == cfgmod.DEFAULT_BASE_URL,
+      str(providers.PROVIDERS[0]))
+check("★`config.DEFAULT_MODEL` 就是 DeepSeek 清单的第一个（= 什么地址都不改时的默认选中）",
+      providers.PROVIDERS[0]["models"][0] == cfgmod.DEFAULT_MODEL,
+      f"{providers.PROVIDERS[0]['models']} vs {cfgmod.DEFAULT_MODEL}")
+check("六家都在，且顺序就是用户口径的写法",
+      [p["name"] for p in providers.PROVIDERS]
+      == ["DeepSeek", "千问 Qwen", "豆包 Doubao", "GLM", "Kimi", "OpenAI"],
+      str([p["name"] for p in providers.PROVIDERS]))
+check("每家都有 http 地址 + 非空模型清单（空清单 ⇒ 点开下拉是一片空白）",
+      all(p["base_url"].startswith("http") and p["models"] for p in providers.PROVIDERS),
+      str([(p["name"], len(p["models"])) for p in providers.PROVIDERS]))
+check("★已下线的旧模型名不许出现（deepseek-chat / -reasoner 2026-07-24 已停用，放进去=一点就报错）",
+      not [m for p in providers.PROVIDERS for m in p["models"]
+           if m in ("deepseek-chat", "deepseek-reasoner")],
+      str([m for p in providers.PROVIDERS for m in p["models"]]))
+check("★地址剥壳：显示文本能还原成纯地址；手输的原文原样返回",
+      providers.base_url_of("DeepSeek · https://api.deepseek.com") == "https://api.deepseek.com"
+      and providers.base_url_of("http://10.0.0.5:8000/v1") == "http://10.0.0.5:8000/v1")
+check("★★自定义地址查不到一家 ⇒ 返回**空**（调用方据此「什么都不做」，绝不能清掉用户的模型名）",
+      providers.models_for("http://10.0.0.5:8000/v1") == []
+      and providers.models_for("https://api.deepseek.com/") == ["deepseek-flash", "deepseek-v4-pro"],
+      str(providers.models_for("http://10.0.0.5:8000/v1")))
+
+_dlg5 = gui.ApiFormDialog("添加 API", [
+    ("name", "AI 名称：", "例如：爱丽丝", "", False),
+    ("api_key", "API Key：", "sk-...", "", True),
+    ("base_url", "接口地址：", "", cfgmod.DEFAULT_BASE_URL, False, providers.address_items()),
+    ("model", "模型名：", "", cfgmod.DEFAULT_MODEL, False, []),
+])
+_dlg5.show()
+qapp.processEvents()
+_b5, _m5 = _dlg5.edits["base_url"], _dlg5.edits["model"]
+check("接口地址 / 模型名 都成了**可编辑下拉**（能选，也能手输 —— 用户明确要保留手输）",
+      isinstance(_b5, gui.QComboBox) and _b5.isEditable()
+      and isinstance(_m5, gui.QComboBox) and _m5.isEditable())
+check("★地址下拉 6 家、显示成「服务商名 · 地址」、默认落到 DeepSeek",
+      _b5.count() == 6 and _b5.currentText() == "DeepSeek · https://api.deepseek.com",
+      f"{_b5.count()} 项 / {_b5.currentText()!r}")
+check("★★可编辑下拉的**编辑区够宽** —— `QComboBox::drop-down` 自己就占 30px，"
+      "`padding-right` 若再留 30px 就是**叠加占两份**（实测只剩 236px），长地址被裁得更狠",
+      _b5.lineEdit().width() >= _b5.width() - 60,
+      f"lineEdit={_b5.lineEdit().width()} / combo={_b5.width()}")
+check("★初值把光标停在**最前面**（光标停末尾时编辑框会滚去显示尾部，服务商名整段被切）",
+      _b5.lineEdit().cursorPosition() == 0, str(_b5.lineEdit().cursorPosition()))
+check("★悬停能看到**完整**文本（编辑区放不下长地址，tooltip 是兜底）",
+      _b5.toolTip() == _b5.currentText(), repr(_b5.toolTip()))
+check("★★`get('base_url')` 必须吐**纯地址** —— 显示文本带「名 · 」前缀，"
+      "存进 config 后 `ai.py` 直接拿它拼 `/chat/completions` ⇒ 请求全挂（且不报错）",
+      _dlg5.get("base_url") == cfgmod.DEFAULT_BASE_URL, repr(_dlg5.get("base_url")))
+check("★默认模型 = deepseek-flash，清单就是 DeepSeek 那两个",
+      _m5.currentText() == "deepseek-flash"
+      and [_m5.itemText(i) for i in range(_m5.count())] == ["deepseek-flash", "deepseek-v4-pro"],
+      f"{_m5.currentText()!r} / {[_m5.itemText(i) for i in range(_m5.count())]}")
+check("★★下拉设了 `NoInsert` —— 否则「回车 = 确认」那一击会把编辑框里的字**插进候选项**"
+      "（越用越脏，而且存不下来、下次开又没了，最难查）",
+      _b5.insertPolicy() == gui.QComboBox.NoInsert, str(_b5.insertPolicy()))
+check("api_key 仍是普通文本框（只有地址/模型两项变下拉）",
+      isinstance(_dlg5.edits["api_key"], gui.QLineEdit)
+      and isinstance(_dlg5.edits["name"], gui.QLineEdit))
+
+_b5.setCurrentIndex(_b5.findText(providers.label_for("https://api.moonshot.cn/v1")))
+qapp.processEvents()
+check("★★换地址 ⇒ 模型清单**当场换掉**（用户口径「根据接口地址的不同选择来进行匹配替换」）",
+      [_m5.itemText(i) for i in range(_m5.count())]
+      == ["kimi-k2.5", "kimi-k2-0905-preview", "moonshot-v1-128k"]
+      and _m5.currentText() == "kimi-k2.5",
+      f"{[_m5.itemText(i) for i in range(_m5.count())]} / {_m5.currentText()!r}")
+check("★换地址后 `get()` 跟着走（不是还吐旧地址）",
+      _dlg5.get("base_url") == "https://api.moonshot.cn/v1", repr(_dlg5.get("base_url")))
+
+_m5.setCurrentText("my-own-model")
+_items5 = [_m5.itemText(i) for i in range(_m5.count())]
+_b5.lineEdit().setText("http://10.0.0.5:8000/v1")     # 走真实的手输路径（编辑框直接改字）
+qapp.processEvents()
+check("★手输自定义地址 ⇒ 模型候选项**原样不动**（不能把用户自己那份清单清空）",
+      [_m5.itemText(i) for i in range(_m5.count())] == _items5, str(_items5))
+check("★★手输地址后 `get('base_url')` 必须是**手输的那串** —— Qt 的可编辑下拉在手输时"
+      "**不更新 currentIndex**（实测 `currentData()` 还停在上一个选中项上），"
+      "所以取值只能按文本反查候选项；信 `currentData()` 就会把旧地址存进去（静默）",
+      _dlg5.get("base_url") == "http://10.0.0.5:8000/v1", repr(_dlg5.get("base_url")))
+check("★模型名也跟着是手输的那个", _dlg5.get("model") == "my-own-model", repr(_dlg5.get("model")))
+_dlg5.close()
+_dlg5.deleteLater()
+
+_dlg6 = gui.ApiFormDialog("编辑 API", [
+    ("name", "AI 名称：", "例如：爱丽丝", "AR1S", False),
+    ("base_url", "接口地址：", "", "https://ark.cn-beijing.volces.com/api/v3", False,
+     providers.address_items()),
+    ("model", "模型名：", "", "ep-20261002-abcdef", False, []),
+])
+_dlg6.show()
+qapp.processEvents()
+check("★编辑一条方舟条目：地址回显成「豆包 Doubao · …」（纯地址能反查回显示文本）",
+      _dlg6.edits["base_url"].currentText()
+      == "豆包 Doubao · https://ark.cn-beijing.volces.com/api/v3",
+      repr(_dlg6.edits["base_url"].currentText()))
+check("★**自定义的接入点 ID 模型名被原样留住**（说明「不在清单里」也不许换掉它）"
+      "，且 get() 两值都干净",
+      _dlg6.get("model") == "ep-20261002-abcdef"
+      and _dlg6.get("base_url") == "https://ark.cn-beijing.volces.com/api/v3",
+      f"{_dlg6.get('model')!r} / {_dlg6.get('base_url')!r}")
+_dlg6.close()
+_dlg6.deleteLater()
+
+# ★★光弹窗支持下拉还不够 —— 调用点**必须真的把候选项传进去**，否则界面看着"没改"。
+#   这里用替身抓 `_add_api` 实际传的 fields（`next_confirm=False` ⇒ 提前 return，不落库）。
+gui.ApiFormDialog = FakeForm
+FakeForm.next_confirm = False
+FakeForm.next_values = {}
+FakeForm.last_fields = None
+panel._add_api()
+gui.ApiFormDialog = _gui_form
+_f5 = {f[0]: f for f in (FakeForm.last_fields or [])}
+check("★★「添加 API」真的把候选项传进了弹窗（base_url 6 项 / model 待联动补）",
+      len(_f5.get("base_url", ())) > 5 and len(_f5["base_url"][5]) == 6
+      and len(_f5.get("model", ())) > 5 and _f5["model"][5] == [],
+      str({k: (len(v[5]) if len(v) > 5 and isinstance(v[5], list) else None)
+           for k, v in _f5.items()}))
+
+# ★★用户**手改**了地址那一行（在「DeepSeek · https://api.deepseek.com」后头补了个 `/v1`）
+#   ⇒ 这串文本就匹配不上任何候选项了 ⇒ `get()` 只能原样吐回**带「名 · 」前缀**的串。
+#   存进 config 之前**必须**再剥一层，否则 `ai.py` 拿它拼 `/chat/completions` ⇒ 请求全挂。
+gui.ApiFormDialog = FakeForm
+FakeForm.next_confirm = True
+FakeForm.next_values = {"name": "手改地址", "api_key": "sk-edit",
+                        "base_url": "DeepSeek · https://api.deepseek.com/v1",
+                        "model": "deepseek-flash"}
+_cur_before = cfgmod.current_api_name(cfg, "alice")
+_n_before = len(cfg["apis"]["alice"])
+panel._add_api()
+gui.ApiFormDialog = _gui_form
+_new7 = [a for a in cfg["apis"]["alice"] if a.get("name") == "手改地址"]
+check("★★用户在地址那一行**手改**过（文本里带上「名 · 」前缀）⇒ 存进 config 的仍必须是"
+      "**纯地址**（不然拼出来的 URL 是坏的，而且不报错）",
+      len(cfg["apis"]["alice"]) == _n_before + 1 and bool(_new7)
+      and _new7[0]["base_url"] == "https://api.deepseek.com/v1",
+      str(_new7))
+# 收尾：把这条测试条目摘掉并恢复「当前 API」，别影响后面几段
+cfg["apis"]["alice"] = [a for a in cfg["apis"]["alice"] if a.get("name") != "手改地址"]
+cfgmod.set_current_api(cfg, _cur_before, "alice")
 
 
 # ========== 5. 关闭行为回归：api.quit 不会死循环 ==========

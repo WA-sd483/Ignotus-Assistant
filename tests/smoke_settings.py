@@ -3756,13 +3756,16 @@ _gp_init = _method_of(_tree_g, "GeneralPanel", "__init__")
 check("★__init__ 把 timeout 接到了 _poll_download（不是别的开关）",
       _gp_init is not None
       and "_poll_download" in {n.attr for n in ast.walk(_gp_init) if isinstance(n, ast.Attribute)})
-_dm = _method_of(_tree_g, "GeneralPanel", "_download_model")
+# ★★2026-10-02：真正的下载动作从 `_download_model` 搬到 `start_download(confirm=)` 了
+#   ——首启那张「立即安装」卡要**跳过确认框**直接开下（用户在卡上已经按过一次"安装"）。
+#   所以这三条 AST 断言改核 `start_download`：`_download_model` 现在只是一句转发。
+_dm = _method_of(_tree_g, "GeneralPanel", "start_download")
 _dm_calls = {(c.func.value.id, c.func.attr) for c in ast.walk(_dm)
              if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
              and isinstance(c.func.value, ast.Name)}
-check("★_download_model 真的调 voice_download.start(...)（AST 按「模块.方法」精确匹配）",
+check("★start_download 真的调 voice_download.start(...)（AST 按「模块.方法」精确匹配）",
       ("voice_download", "start") in _dm_calls, str(sorted(_dm_calls)))
-check("★_download_model 先看 is_running（下载中再点 = 分流去「取消」，不会起第二次下载）",
+check("★start_download 先看 is_running（下载中再点 = 分流去「取消」，不会起第二次下载）",
       ("voice_download", "is_running") in _dm_calls and ("self", "_cancel_download") in _dm_calls,
       str(sorted(_dm_calls)))
 # ★★下载前的确认框（2026-09-27 用户要求「点击确认后才正式开始下载」）。
@@ -3774,7 +3777,7 @@ for _n in ast.walk(_dm):
     if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Attribute) \
             and isinstance(_n.func.value, ast.Name):
         _dm_ln.setdefault((_n.func.value.id, _n.func.attr), _n.lineno)
-check("★_download_model 里真的过 ConfirmDialog.confirm（AST 按「类.方法」精确匹配）",
+check("★start_download 里真的过 ConfirmDialog.confirm（AST 按「类.方法」精确匹配）",
       ("ConfirmDialog", "confirm") in _dm_ln, str(sorted(_dm_ln)))
 check("★确认框排在 voice_download.start **之前**（按 lineno 比；插在 start 之后等于没拦）",
       _dm_ln.get(("ConfirmDialog", "confirm"), 9999) < _dm_ln.get(("voice_download", "start"), 0),
@@ -4618,6 +4621,50 @@ check("前置三件套仍在 If **之后**、顺序不变（raise_ → activateW
       str(_self_calls(_b2f_top[1:])))
 check("⚠️ 不许自己造「先记最大化位再 showMaximized()」那套（多余，且会把「最大化着点托盘」弄乱）",
       "showMaximized" not in _self_calls(_b2f_fn), str(_self_calls(_b2f_fn)))
+
+# ---- 窗口尺寸恒定：**用户没有任何能改大小的入口**（2026-10-02 第六批）----
+# 用户报「双击软件窗口顶部栏时，会将窗口铺满整个屏幕」。真机量到本窗口的
+# `GWL_STYLE = 0x96000000` —— 只有 `WS_POPUP|WS_VISIBLE|WS_CLIPSIBLINGS|WS_CLIPCHILDREN`，
+# **没有** `WS_THICKFRAME`（⇒ 拖边拉伸本来就做不到，Aero Snap 也不生效）/ `WS_MAXIMIZEBOX`
+# （⇒ 系统没有最大化按钮）/ `WS_CAPTION`。所以「双击标题栏」是**唯一**能把窗口撑到全屏的入口
+# —— 把它删掉，「窗口大小永远不变」就成立了。
+# ★这三条是**结构层**的守卫（offscreen 下拿不到 HWND，量不了 GWL_STYLE，所以只能钉代码形状）。
+_bt_fn = next((n for n in _mw.body
+               if isinstance(n, ast.FunctionDef) and n.name == "_build_titlebar"), None)
+
+
+def _assigned_attrs(fn):
+    """`fn` 里被赋值过的 `X.attr` 名（含 `bar.mouseDoubleClickEvent = ...` 这种）。"""
+    out = []
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                for sub in ast.walk(t):
+                    if isinstance(sub, ast.Attribute):
+                        out.append(sub.attr)
+    return out
+
+
+check("★标题栏**不绑双击**（用户口径「窗口大小永远不变，不能铺满全屏」）—— 这一条删了，"
+      "窗口就还能被双击撑到全屏",
+      _bt_fn is not None and "mouseDoubleClickEvent" not in _assigned_attrs(_bt_fn),
+      str(sorted(set(_assigned_attrs(_bt_fn)))) if _bt_fn is not None else "(没找到 _build_titlebar)")
+check("★`toggleMaximized()` 已**整个删掉**（别留死代码 —— 留着会让人以为还有入口，§26.4）",
+      not any(isinstance(n, ast.FunctionDef) and n.name == "toggleMaximized" for n in _mw.body),
+      str([n.name for n in _mw.body if isinstance(n, ast.FunctionDef)
+           and "maxim" in n.name.lower()]))
+_mw_max_calls = [n.func.attr for n in ast.walk(_mw) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute)
+                 and n.func.attr in ("showMaximized", "setWindowState", "showFullScreen")]
+check("★MainWindow 里**一处**最大化/全屏入口都不许有（双保险：万一哪天从别处又冒出来）",
+      _mw_max_calls == [], str(_mw_max_calls))
+_mw_ctor0 = next((n for n in _mw.body
+                  if isinstance(n, ast.FunctionDef) and n.name == "__init__"), None)
+check("★⚠️也别用 `setFixedSize` 来「加固」：用户要的是「**用户**改不了大小」，不是「程序改不了」"
+      "—— `setFixedSize` 会让 `resize()` 变成空操作，而截图工具（860×560）与 `smoke_pipeline`"
+      "里按不同窗宽验证气泡上限的用例，都靠程序自己 resize",
+      _mw_ctor0 is not None and "setFixedSize" not in _self_calls(_mw_ctor0),
+      str(_self_calls(_mw_ctor0)) if _mw_ctor0 is not None else "(没有 __init__)")
 
 # 前提断言：这条修法依赖「裸 show() 对最小化窗口无效」这个 Qt 行为 ——
 # 万一哪天 Qt / 平台变了（show() 会自己还原），这条红，提醒回来重看 docs/02 §17.2 还需不需要。

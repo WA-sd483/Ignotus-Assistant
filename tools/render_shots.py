@@ -104,20 +104,26 @@ def shoot_api_dialogs():
     核对点：**没有系统标题栏**、卡片 16px 圆角 + 淡蓝边框、取消（灰边）与确认（蓝底）
     两款按钮分明、输入框圆角 15px 且不会把卡片撑过 360px。用 `dlg.grab()` 单独抓
     （`win.grab()` 不含子对话框）。
+
+    ★2026-10-02（`rev50`）：「接口地址 / 模型名」改成了**可编辑下拉** —— 图里那两行现在是
+    胶囊下拉框（右侧圆箭头），且地址那行的显示文本是「服务商名 · 地址」。**这里必须跟
+    `_add_api` / `_edit_row` 传同一套 fields**（第 6 项 = 候选项），否则截出来的图跟真弹窗
+    长得不一样（截图的意义就没了）。另外多出两张展开态的图，看两家候选项。
     """
     win._show_manage_page(win.PAGE_API)
     settle()
+    _addr = gui.providers.address_items()
     cases = [
         ("manage-api-add-dialog", "添加 API", [
             ("name", "AI 名称：", "例如：爱丽丝", "", False),
             ("api_key", "API Key：", "sk-...", "", True),
-            ("base_url", "接口地址：", DEFAULT_BASE_URL, DEFAULT_BASE_URL, False),
-            ("model", "模型名：", DEFAULT_MODEL, DEFAULT_MODEL, False),
+            ("base_url", "接口地址：", "", DEFAULT_BASE_URL, False, _addr),
+            ("model", "模型名：", "", DEFAULT_MODEL, False, []),
         ]),
         ("manage-api-edit-dialog", "编辑 API", [
             ("name", "AI 名称：", "例如：爱丽丝", "AR1S", False),
-            ("base_url", "接口地址：", DEFAULT_BASE_URL, "https://api.deepseek.com", False),
-            ("model", "模型名：", DEFAULT_MODEL, "deepseek-flash", False),
+            ("base_url", "接口地址：", "", "https://api.deepseek.com", False, _addr),
+            ("model", "模型名：", "", "deepseek-flash", False, []),
         ]),
     ]
     for name, title, fields in cases:
@@ -130,6 +136,28 @@ def shoot_api_dialogs():
               f"edits={len(dlg.edits)} pwd={dlg.edits.get('api_key').echoMode() if 'api_key' in dlg.edits else '-'}")
         dlg.close()
         settle(120)
+
+    # 两张展开态：地址那 6 家 / 切到 Kimi 后的模型清单（用户口径「下拉条里显示几个模型」）
+    dlg = gui.ApiFormDialog("添加 API", cases[0][2], win)
+    dlg.show()
+    settle(400)
+    for name, attr, pick in (("manage-api-add-address-list", "base_url", None),
+                             ("manage-api-add-model-list", "model",
+                              "Kimi · https://api.moonshot.cn/v1")):
+        if pick:
+            _b = dlg.edits["base_url"]
+            _b.setCurrentIndex(_b.findText(pick))     # 先切到 Kimi ⇒ 模型清单跟着换
+            settle(160)
+        _c = dlg.edits[attr]
+        _c.showPopup()
+        settle(240)
+        _view = _c.view().window()
+        path = OUT_DIR / f"{name}.png"
+        _view.grab().save(str(path))
+        print(f"saved {path.name:30s} size={_view.width()}x{_view.height()}")
+        _c.hidePopup()
+        settle(120)
+    dlg.close()
 
 
 def shoot_preset():
@@ -1566,6 +1594,41 @@ def shoot_general_model_confirm_full():
         settle()
 
 
+def shoot_notice():
+    """启动提示区（**浮层**，2026-10-02）：摆着的样子 + 关掉之后的样子。
+
+    核对点：① 它挂在标题栏正下方、**不进布局** —— 关掉它时下方界面一个像素都不许动；
+    ② 底边有一条柔和阴影（没有影子就看不出"浮在上层"）；
+    ③ ✕ / 倒计时那一列与前后的行对齐。
+
+    ★它平时**只在启动时**出现一次（`main.py` 里调 `show_startup_notices`），
+      所以别的截图里根本看不到它 —— 想看它就得像这里一样手动摆一次。
+    """
+    win.set_health_facts_provider(lambda: {"tts_installed": True, "asr_ok": True})
+    win.refresh_health()
+    win.show_startup_notices()
+    settle()
+    y0 = win._chat_view.mapTo(win, QPoint(0, 0)).y()
+    h0 = win._chat_view.height()
+    path = OUT_DIR / "notice-overlay.png"
+    win.grab().save(str(path))
+    # ★浮层判据：它**不在**主窗口的布局里（`{...}` 里的表达式不能跨两个字符串字面量写，
+    #   所以先算好再 f-string）
+    in_layout = any(win.layout().itemAt(i).widget() is win._notice_area
+                    for i in range(win.layout().count()))
+    print(f"saved {path.name:22s} rows={sorted(win._notice_on)} "
+          f"geom={win._notice_area.geometry()} "
+          f"shadow={win._notice_area.graphicsEffect() is not None} in_layout={in_layout}")
+    # 关掉（白名单那条的 ✕ + 语音那条的 ✕）⇒ 再抓一张：底下那半屏必须纹丝不动
+    win._perm_row[4].click()
+    win._voice_row[4].click()
+    settle(300)
+    win.grab().save(str(OUT_DIR / "notice-overlay-dismissed.png"))
+    y1 = win._chat_view.mapTo(win, QPoint(0, 0)).y()
+    h1 = win._chat_view.height()
+    print(f"saved notice-overlay-dismissed.png 内容位移 dy={y1 - y0} dh={h1 - h0}（都必须是 0）")
+
+
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     shoot("main-chat")
@@ -1641,6 +1704,9 @@ def main():
     print(f"  滚回顶部后 → shown={top_btn.is_shown()} visible={top_btn.isVisible()}")
 
     shoot_permissions_rename()
+    # ★提示区放在**最后**：它会把「这次运行已经关掉了」记下来（`_perm_dismissed`），
+    #   放前面会影响后面那些图的提示区状态。
+    shoot_notice()
     shoot_mid_frame()
     shoot_pet_bubble()
     shoot_pet_bubble_pages()

@@ -15,10 +15,19 @@ DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-flash"
 
 DEFAULT_CONFIG = {
-    # [{"name": str, "api_key": str, "base_url": str, "model": str}]  名称与 key 绑定
-    # base_url / model 留空即用 DEFAULT_BASE_URL / DEFAULT_MODEL
-    "apis": [],
-    "current_api": "",    # 当前使用的 API 名称（同一时刻只有这一个生效）
+    # ★★2026-10-02（用户口径「每个角色用独立的列表，可以用同个 key，但命名是分开显示的」）：
+    #   **每个角色一份完全独立的 API 列表** —— 结构 {角色key: [条目, …]}，
+    #   条目 = {"name": str, "api_key": str, "base_url": str, "model": str}
+    #   （base_url / model 留空即用 DEFAULT_BASE_URL / DEFAULT_MODEL）。
+    #   ★同一个 key 可以在两个角色下各录一次、**命名也可以各不相同**，互相看不见、删一个
+    #     不影响另一个。这就是「独立列表」与「共用一份、各自选一个」的分野 —— 后者做不到
+    #     「同一个 key 在两边显示成不同名字」。
+    #   ★这里留**空 dict**：真正的角色键由 `load_config` 按 `cfg["roles"]` 补齐 ——
+    #     将来加角色（艾莲贴图做完时）不用回来改这里，也就不会出现「新角色没有 apis 键」。
+    "apis": {},
+    # 每个角色**当前生效**的那一个 API 的名字（各自独立；空串 = 该角色还没有可用 API）。
+    # ★与 `apis` 一样是 {角色key: 名字}；老配置里那个字符串由 `_normalize_apis` 迁移。
+    "current_api": {},
     "current_role": "alice",
     "volume": 0.5,        # 音量 0.0~1.0，默认 50%；0 表示静音（静音时跳过合成加快回复）
     # 通用设置（设置 → 通用设置）
@@ -218,6 +227,135 @@ def _merge_presets(defaults, saved) -> list:
     return out
 
 
+# 旧版（只有一份全局 API 列表）迁移落点 —— **永远是 alice**，见 `_normalize_apis`。
+LEGACY_API_ROLE = "alice"
+
+
+def _norm_api_entries(raw) -> list:
+    """把一段 API 列表清洗成规范条目：名称/密钥转字符串、补全 base_url 与 model。
+
+    ★无名条目直接丢（一个没有名字的条目在界面上是点不动、也选不中的幽灵行），
+      非 dict 的脏项同理 —— 与旧实现逐字一致，别改口径。
+    """
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            continue
+        out.append({
+            "name": name,
+            "api_key": str(entry.get("api_key", "") or "").strip(),
+            "base_url": str(entry.get("base_url", "") or "").strip() or DEFAULT_BASE_URL,
+            "model": str(entry.get("model", "") or "").strip() or DEFAULT_MODEL,
+        })
+    return out
+
+
+def _normalize_apis(cfg) -> tuple:
+    """API 段归一化：**每个角色一份独立列表**（2026-10-02 用户口径）。
+
+    返回 `(apis, current_api)` 两个 dict，键都是角色 key。
+
+    三件事：
+      ① **迁移**：旧结构是**一份全局列表**（`"apis": [...]` + `"current_api": "名字"`），
+         更老的还有单 key 的 `"api_key": "sk-…"`。一律搬进 **alice**。
+         ★**不能**按 `cfg["current_role"]` 落 —— 老配置里那个字段可能是 `"ellen"`
+         （用户以前切过去过，见 `SWITCHABLE_ROLES`），那样会把老师唯一的那把 key
+         塞进一个**当前根本切不过去**的角色里，等于配置凭空消失、界面显示「没配 API」。
+      ② **补齐**：每个角色都要有 `apis` / `current_api` 键（缺了就补空）——
+         将来 `roles` 里加角色时自动获得，不用回来改 `DEFAULT_CONFIG`。
+      ③ **校验**：`current_api[角色]` 必须真的在那个角色的列表里，否则回落到该列表第一项
+         （列表空 ⇒ 空串）。★与旧的单角色逻辑同一个口径，只是按角色各来一遍。
+    """
+    raw = cfg.get("apis")
+    raw_cur = cfg.get("current_api")
+    apis, currents = {}, {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            apis[str(k)] = _norm_api_entries(v)
+        if isinstance(raw_cur, dict):
+            for k, v in raw_cur.items():
+                currents[str(k)] = str(v or "").strip()
+        # ★更老的「单 key」结构：此时 `apis` 是**新默认值那个空 dict**（`_deep_merge` 把
+        #   盘上的 `api_key` 合了进来，而它压根不认识 apis 这个键）⇒ 只有「一份条目都没有」
+        #   时才认它，免得把用户后来真配好的列表又糊上一条「默认」。
+        if not any(apis.values()):
+            old_key = str(cfg.get("api_key") or "").strip()
+            if old_key:
+                apis[LEGACY_API_ROLE] = [{
+                    "name": "默认", "api_key": old_key,
+                    "base_url": DEFAULT_BASE_URL, "model": DEFAULT_MODEL,
+                }]
+                currents[LEGACY_API_ROLE] = "默认"
+    else:
+        legacy = _norm_api_entries(raw)
+        if not legacy:
+            old_key = str(cfg.get("api_key") or "").strip()
+            if old_key:
+                legacy = [{"name": "默认", "api_key": old_key,
+                           "base_url": DEFAULT_BASE_URL, "model": DEFAULT_MODEL}]
+                raw_cur = "默认"
+        apis[LEGACY_API_ROLE] = legacy
+        currents[LEGACY_API_ROLE] = str(raw_cur or "").strip()
+    cfg.pop("api_key", None)      # 迁移完就不该再留着（留着只会在下次写盘时复活）
+
+    keys = role_keys(cfg)
+    for rk in keys:
+        apis.setdefault(rk, [])
+        names = [a["name"] for a in apis[rk]]
+        if currents.get(rk) not in names:
+            currents[rk] = names[0] if names else ""
+    # 配置里有、`roles` 里没有的脏键（角色被删掉 / 手改出来的名字）：丢。留着它只会
+    # 「永远显示不出来、却一直跟着写盘」，属于最难查的一类不一致。
+    return ({k: v for k, v in apis.items() if k in keys},
+            {k: v for k, v in currents.items() if k in keys})
+
+
+def role_keys(cfg) -> list:
+    """配置里有哪些角色（`roles` 的键，保序）。**角色列表的唯一入口**。"""
+    roles = cfg.get("roles")
+    keys = [str(k) for k in roles] if isinstance(roles, dict) and roles else []
+    return keys or [LEGACY_API_ROLE]
+
+
+def apis_for(cfg, role_key=None) -> list:
+    """**某个角色**的 API 列表（`role_key` 省略 ⇒ 当前角色）。取值的唯一入口。"""
+    rk = str(role_key or cfg.get("current_role") or LEGACY_API_ROLE)
+    apis = cfg.get("apis")
+    if not isinstance(apis, dict):
+        return []
+    out = apis.get(rk)
+    return out if isinstance(out, list) else []
+
+
+def current_api_name(cfg, role_key=None) -> str:
+    """**某个角色**当前生效的 API 名字（空串 = 还没选 / 列表是空的）。"""
+    rk = str(role_key or cfg.get("current_role") or LEGACY_API_ROLE)
+    cur = cfg.get("current_api")
+    if not isinstance(cur, dict):
+        return ""
+    return str(cur.get(rk) or "")
+
+
+def set_current_api(cfg, name, role_key=None) -> None:
+    """把**某个角色**的「当前 API」改成 `name`（就地改，不重写整个 dict）。"""
+    rk = str(role_key or cfg.get("current_role") or LEGACY_API_ROLE)
+    cur = cfg.get("current_api")
+    if not isinstance(cur, dict):
+        cur = {}
+        cfg["current_api"] = cur
+    cur[rk] = str(name or "")
+
+
+def has_any_api(cfg) -> bool:
+    """**任意一个角色**配过任意一个 API —— 判「老用户 / 新用户」用。"""
+    return any(apis_for(cfg, rk) for rk in role_keys(cfg))
+
+
 def load_config() -> dict:
     # ★★必须 **deepcopy**，不能只 `_deep_merge(DEFAULT_CONFIG, {})`。
     #   `_deep_merge` 是**浅拷贝**：`out = dict(base)`，遇到 dict 递归、遇到 **list 直接沿用同一个
@@ -235,37 +373,8 @@ def load_config() -> dict:
             cfg = _deep_merge(cfg, override)
         except Exception:
             pass
-    # 迁移旧版单 key 结构：api_key -> apis 列表
-    if not cfg.get("apis") and cfg.get("api_key"):
-        cfg["apis"] = [{"name": "默认", "api_key": cfg["api_key"]}]
-        cfg["current_api"] = "默认"
-        cfg.pop("api_key", None)
-    # 归一化每个 API 条目：名称/密钥必须为字符串；补全 base_url 与 model（留空即默认值）。
-    # 这样旧配置（只有 name+api_key）也能自动获得 DeepSeek 默认端点，不会因缺字段报错。
-    raw_apis = cfg.get("apis")
-    if not isinstance(raw_apis, list):
-        raw_apis = []
-        cfg["apis"] = raw_apis
-    norm_apis = []
-    for entry in raw_apis:
-        if not isinstance(entry, dict):
-            continue
-        name = str(entry.get("name", "")).strip()
-        if not name:
-            continue
-        base = str(entry.get("base_url", "") or "").strip() or DEFAULT_BASE_URL
-        model = str(entry.get("model", "") or "").strip() or DEFAULT_MODEL
-        norm_apis.append({
-            "name": name,
-            "api_key": str(entry.get("api_key", "") or "").strip(),
-            "base_url": base,
-            "model": model,
-        })
-    cfg["apis"] = norm_apis
-    # 保证 current_api 有效：为空或不在列表时指向第一个
-    names = [a["name"] for a in norm_apis]
-    if cfg.get("current_api") not in names:
-        cfg["current_api"] = names[0] if names else ""
+    # API 段：**每个角色一份独立列表**（2026-10-02）。迁移 + 补齐 + 校验全在下面这个纯函数里。
+    cfg["apis"], cfg["current_api"] = _normalize_apis(cfg)
     # 音量：默认 0.5，兼容缺失/类型错误，限制在 0.0~1.0
     try:
         vol = float(cfg.get("volume", 0.5))
@@ -388,13 +497,31 @@ def load_config() -> dict:
     return cfg
 
 
-def get_current_api(cfg: dict) -> dict | None:
-    """返回当前使用的 API（名称+key），无则 None。"""
-    name = cfg.get("current_api")
-    for a in cfg.get("apis", []):
+def get_current_api(cfg: dict, role_key: str | None = None) -> dict | None:
+    """返回**该角色**当前使用的 API（条目 dict），无则 None。
+
+    ★`role_key` 省略 ⇒ 当前角色（`cfg["current_role"]`）。2026-10-02 起 API 是**每个角色
+      一份独立列表**，所以「当前 API」这个问题必须回答清楚是**谁的** —— 这也是本函数唯一
+      的取值入口（判据、界面、AI 调用都走它，别在别处直接翻 `cfg["apis"]`）。
+    """
+    name = current_api_name(cfg, role_key)
+    for a in apis_for(cfg, role_key):
         if a.get("name") == name:
             return a
     return None
+
+
+def is_first_launch() -> bool:
+    """本机是否**初次**打开（= `config.json` 还不存在）。
+
+    ★真值就是**文件在不在**：`load_config` 从不创建它，只有 `save_config` 才写。
+    ★★调用时机：必须在**任何 `save_config` 之前**取（`main()` 一进来就取），
+      否则「退出时存过一次盘」之后再问就永远是 False 了。
+    ★它与「有没有配过 API」是**两件事**：老用户（有 config.json）换新版本、想要
+      首启的模型安装引导时，不该再被弹一次；反过来，配置文件在、但没配 API 的人，
+      由聊天区的灰字提示兜住（见 main.py）。
+    """
+    return not CONFIG_PATH.exists()
 
 
 # 只在本次运行内有效、**不写进 config.json** 的字段（写了反而误导：读回来会被忽略）。
